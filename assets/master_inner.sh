@@ -108,7 +108,13 @@ start_guest_media() {
     echo "[Pivoted Root] Starting $name..."
     $BB setuidgid media "$b" > "/data/$name.log" 2>&1 &
     sleep 1
-    if ! pidof "$name" >/dev/null 2>&1; then
+    # Linux comm is limited to 15 characters, so pidof cannot match long names
+    # such as mediaresourcemanager directly. Check both forms.
+    short=$(echo "$name" | cut -c1-15)
+    running=0
+    pidof "$name" >/dev/null 2>&1 && running=1
+    [ "$short" != "$name" ] && pidof "$short" >/dev/null 2>&1 && running=1
+    if [ "$running" -eq 0 ]; then
         echo "[Pivoted Root] $name did not start as media; retrying as root"
         "$b" > "/data/$name.log" 2>&1 &
         sleep 1

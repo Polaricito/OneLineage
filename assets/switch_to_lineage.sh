@@ -274,6 +274,8 @@ done
 for p in media mediaserver media.codec mediaextractor mediametrics mediaresourcemanager; do
     kill -9 $(pidof "$p") 2>/dev/null || true
 done
+# pidof truncates comm to 15 chars; match the long resource-manager name too.
+pkill -9 -f "/system/bin/mediaresourcemanager" 2>/dev/null || true
 
 # Wait until the service names are actually gone. If a host mediaserver is still
 # registered, the guest's mediaserver cannot claim media.player and falls back
