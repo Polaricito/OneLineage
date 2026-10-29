@@ -4,13 +4,13 @@ ROOTFS="$STAGE/rootfs"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
-echo "=== 1. Ensuring Watchdog Feeder is Active ==="
-if ! ps -ef | grep -v grep | grep -q "/dev/watchdog"; then
-    echo "Starting watchdog feeder..."
-    nohup $BB sh -c "while true; do echo -n 1 > /dev/watchdog 2>/dev/null; sleep 2; done" </dev/null >/dev/null 2>&1 &
-fi
+# Do NOT open /dev/watchdog here. Android's watchdogd owns the device; a second
+# opener gets EBUSY, and the old `ps | grep /dev/watchdog` check matched this
+# shell's own command line, so the "feeder" was a no-op. switch_to_lineage.sh
+# keeps watchdogd schedulable and guest_guard.sh aborts before the guest can
+# starve it.
 
-echo "=== 2. Creating Loop Device Nodes ==="
+echo "=== 1. Creating Loop Device Nodes ==="
 for i in $(seq 50 150); do
     minor=$((i * 8))
     rm -f /dev/block/loop$i /dev/loop$i 2>/dev/null || true
@@ -18,7 +18,7 @@ for i in $(seq 50 150); do
     mknod /dev/loop$i b 7 $minor
 done
 
-echo "=== 3. Mounting system.raw if needed ==="
+echo "=== 2. Mounting system.raw if needed ==="
 if mount | grep -q "$ROOTFS "; then
     if [ ! -f "$ROOTFS/system/bin/sh" ] || [ ! -f "$ROOTFS/init.environ.rc" ]; then
         echo "Rootfs mount is invalid or stale. Unmounting..."
@@ -46,7 +46,7 @@ mkdir -p "$ROOTFS/postinstall" "$ROOTFS/dev" "$ROOTFS/proc" "$ROOTFS/sys" \
     "$ROOTFS/linkerconfig" "$ROOTFS/vendor" "$ROOTFS/odm" "$ROOTFS/vendor_dlkm" \
     "$ROOTFS/mnt" "$ROOTFS/storage" "$ROOTFS/apex" "$ROOTFS/data"
 
-echo "=== 4. Setting up Core System Bind Mounts ==="
+echo "=== 3. Setting up Core System Bind Mounts ==="
 mount | grep -q "$ROOTFS/proc " || $BB mount -t proc proc "$ROOTFS/proc"
 mount | grep -q "$ROOTFS/sys " || $BB mount -t sysfs sysfs "$ROOTFS/sys"
 
@@ -114,7 +114,7 @@ fi
 
 
 
-echo "=== 5. Setting up Isolated Data & Bridges ==="
+echo "=== 4. Setting up Isolated Data & Bridges ==="
 mkdir -p "$STAGE/data/adb" "$STAGE/data/apex" "$STAGE/data/dalvik-cache/arm64"
 
 # Give the guest the host's authorised ADB keys. The container has no
@@ -192,6 +192,13 @@ mkdir -p "$STAGE/data/misc/bluedroid" "$STAGE/data/misc/bluetooth" 2>/dev/null
 chown 1002:1002 "$STAGE/data/misc/bluedroid" "$STAGE/data/misc/bluetooth" 2>/dev/null || true
 chmod 0770 "$STAGE/data/misc/bluedroid" "$STAGE/data/misc/bluetooth" 2>/dev/null || true
 
+# The guest's own media stack runs inside the container (see master_inner.sh).
+# It needs the same persistent directories a real /data would have; without
+# them mediaserver/media.codec cannot save their state and may crash-loop.
+mkdir -p "$STAGE/data/misc/media" "$STAGE/data/vendor/media" 2>/dev/null || true
+chown 1013:1013 "$STAGE/data/misc/media" "$STAGE/data/vendor/media" 2>/dev/null || true
+chmod 0770 "$STAGE/data/misc/media" "$STAGE/data/vendor/media" 2>/dev/null || true
+
 # SELinux labels matter just as much as modes here. Every directory below lives
 # under /data/local/tmp, so it is created as u:object_r:shell_data_file:s0. The
 # guest's system_server runs in u:r:system_server:s0 (Samsung policy) and is
@@ -203,7 +210,7 @@ chmod 0770 "$STAGE/data/misc/bluedroid" "$STAGE/data/misc/bluetooth" 2>/dev/null
 # Relabel the staged tree the way a real /data is labeled. The host bind mounts
 # that live inside this tree (/data/apex, /data/adb, /data/media) are deliberately
 # excluded so host data never gets relabeled.
-echo "=== 5b. Relabeling staged /data for guest SELinux ==="
+echo "=== 4b. Relabeling staged /data for guest SELinux ==="
 $BB chcon u:object_r:system_data_file:s0 "$STAGE/data" 2>/dev/null || true
 for d in data/system data/system_de data/system_ce data/user data/user_de \
          data/misc data/misc_de data/misc_ce data/anr data/dalvik-cache \
@@ -220,7 +227,7 @@ done
 # are the host's own directories bind-mounted in, already labeled correctly, and
 # chcon-ing a bind mount would relabel the host's copy.
 
-echo "=== 5c. Fixing staged /data ownership and modes ==="
+echo "=== 4c. Fixing staged /data ownership and modes ==="
 # The stage tree is created by root under /data/local/tmp, so its top-level
 # directories come out root:root 0755. A real /data is system:system 0771, and
 # system_server (uid 1000) has to be able to create /data/app/vmdl*.tmp:
@@ -241,7 +248,7 @@ for d in "$STAGE/data/misc/profiles/cur" "$STAGE/data/misc/profiles/ref" \
     [ -d "$d" ] && $BB chown system:system "$d" 2>/dev/null || true
 done
 
-echo "=== 5d. Bridging host /data app trees into the staged /data ==="
+echo "=== 4d. Bridging host /data app trees into the staged /data ==="
 # installd and artd are HOST daemons (started by Samsung init, they cannot be
 # moved into the container namespace). Left alone they create every app data
 # dir, dalvik-cache entry and dexopt profile in the real /data, which the guest
@@ -265,7 +272,7 @@ mount | grep -q "$ROOTFS/data/apex " || $BB mount --bind /data/apex "$ROOTFS/dat
 mkdir -p "$ROOTFS/data/media"
 mount | grep -q "$ROOTFS/data/media " || $BB mount --bind /data/media "$ROOTFS/data/media" 2>/dev/null || true
 
-echo "=== 5e. Writing per-package data-dir helper ==="
+echo "=== 4e. Writing per-package data-dir helper ==="
 # Apps installed before the /data bridge existed have no CE/DE data dirs in the
 # guest tree, and the guest zygote refuses to fork them:
 #   Failed to mount /data_mirror/data_de/null/0/<pkg> to /data/user_de/0/<pkg>
@@ -537,7 +544,7 @@ done
 APPLOOP
 chmod 755 "$STAGE/data/local/tmp/app_storage_loop.sh" 2>/dev/null || true
 
-echo "=== 6. Setting up /system/xbin/su (KernelSU Bridge) ==="
+echo "=== 5. Setting up /system/xbin/su (KernelSU Bridge) ==="
 if ! mount | grep -q "$ROOTFS/system/xbin "; then
     $BB mount -t tmpfs tmpfs "$ROOTFS/system/xbin"
     SU_SRC="/data/adb/ksud"
@@ -546,7 +553,7 @@ if ! mount | grep -q "$ROOTFS/system/xbin "; then
     [ -f "$SU_SRC" ] && cp "$SU_SRC" "$ROOTFS/system/xbin/su" && chmod 755 "$ROOTFS/system/xbin/su"
 fi
 
-echo "=== 7. Setting up Fresh APEX tmpfs ==="
+echo "=== 6. Setting up Fresh APEX tmpfs ==="
 # Clean any stale submounts and ensure a clean, writable tmpfs
 for m in $(cat /proc/mounts 2>/dev/null | grep "$ROOTFS/apex" | awk '{print $2}' | sort -r); do
     $BB umount -l "$m" 2>/dev/null || true
@@ -565,7 +572,7 @@ else
 fi
 chmod 644 "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || true
 
-echo "=== 8. Direct Mounting Extracted APEX Payloads ==="
+echo "=== 7. Direct Mounting Extracted APEX Payloads ==="
 mount_payload() {
     NAME="$1"
     TARGET="$2"
@@ -637,7 +644,7 @@ if [ -d /system/apex ]; then
     mount | grep -q "$ROOTFS/system/apex " || $BB mount --bind /system/apex "$ROOTFS/system/apex"
 fi
 
-echo "=== 9. Bind-mounting Remaining Non-Payload APEXes ==="
+echo "=== 8. Bind-mounting Remaining Non-Payload APEXes ==="
 for a in /apex/*; do
     [ -d "$a" ] || continue
     base=$(basename "$a")

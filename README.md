@@ -19,10 +19,12 @@ Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on
 | --- | --- |
 | `src/`, `res/`, `AndroidManifest.xml` | The Android app (`com.wewaffles.onelineage`) |
 | `assets/master_prepare.sh` | Stages the rootfs, binds the patched files, fixes labels/ownership |
-| `assets/master_inner.sh` | Runs inside the container, starts the guest zygote |
+| `assets/master_inner.sh` | Runs inside the container, starts the guest media stack and zygote |
 | `assets/switch_to_lineage.sh` / `return_to_oneui.sh` | Switch in and back out |
+| `assets/guest_guard.sh` | Host-side watchdog/media-storm guard with automatic rollback |
+| `assets/preflight.sh` | Collects model, watchdog, media, SELinux and storage diagnostics |
 | `assets/zygote_exec` | Static aarch64 launcher for the guest zygote |
-| `build_apk.sh` | Builds and signs the APK |
+| `build_apk.sh` | Builds and signs the APK (portable paths, SDK auto-detection) |
 
 ## Patches
 
@@ -44,18 +46,42 @@ Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on
 9. **adb.** `Settings.Global.ADB_ENABLED` is pre-seeded, host `adb_keys` are copied into the guest, and `adb_watchdog.sh` keeps adbd and the USB gadget alive.
 10. **Networking.** The preferred APN is switched to `IPV4V6`, and `net_fix.sh` maintains a private routing table (4242) because the guest's ConnectivityService can't program the host's netd.
 11. **SMS.** `ims_watchdog.sh` keeps One UI's `imsd` running and `switch_to_lineage.sh` waits for voice registration before pivoting.
-12. **Boot diagnostics.** Each boot writes `/data/boot_failures.log`.
+12. **Boot diagnostics.** Each boot writes `/data/boot_failures.log`; the app's **Run diagnostics** button (or `preflight.sh` over adb) captures model, SELinux, watchdog, media-service, storage and dmesg state.
+13. **Media handover and watchdog safety.** The host's whole media stack (`media`, `media.codec`, `media.extractor`, `media.metrics`, `media.resource_manager`) is stopped, and the GSI's own `mediaserver`/`media.codec` are started inside the container. `MediaCodecList` gets a compatible `IMediaCodecList` from the guest instead of parsing Samsung's parcel layout in a loop. `watchdogd`, `logd`, `adbd`, `imsd` and `netd` are pinned to CPU 0, `watchdogd` gets RT priority, and the guest runs on CPUs 1..N-1. `guest_guard.sh` samples the log tail and `dmesg`, and rolls back to One UI before the ~100 s watchdog panic.
 
 ## Known issues
 - Returning to One UI may still need a manual reboot.
-- The guest binds the host's `media.codec`, whose AIDL hash differs from the GSI's, which can cause high CPU during codec enumeration.
 - No IMS stack in the guest, so **voice calls don't work** (data and SMS depend on One UI's `imsd`).
 - Developer options crash (the guest registers no `adb` service).
 - DTMF tones glitch, and deep-buffer audio hangs, so it stays disabled.
 - Never kill the host `netd` while Lineage is running.
 
 ## Building
-Edit the paths at the top of `build_apk.sh` (JDK 17, Android SDK build-tools 34, android-34 platform), provide your own signing keystore, then run `./build_apk.sh`.
+`build_apk.sh` auto-detects the Android SDK (`ANDROID_SDK_ROOT`/`ANDROID_HOME`, then the usual Windows/macOS/Linux locations), the newest installed build-tools and the android-34 platform. It creates a debug keystore on first use and writes `OneLineage-5.8.apk` in the project root.
+
+Requirements: JDK 17+ and Android SDK build-tools **36.0.0** (build-tools 34's `d8` crashes on the enum in `MainActivity` under JDK 21), plus platform 34. Install them with:
+
+```sh
+sdkmanager "platforms;android-34" "build-tools;36.0.0"
+```
+
+Then run:
+
+```sh
+./build_apk.sh
+```
+
+Override paths if needed:
+
+```sh
+ANDROID_SDK_ROOT=/path/to/sdk BUILD_TOOLS=/path/to/build-tools/36.0.0 ./build_apk.sh
+```
+
+To collect diagnostics on a device:
+
+```sh
+adb shell su -c 'sh /data/local/tmp/lineage_stage/preflight.sh'
+```
 
 ## Credits
 LineageOS GSI builds by MisterZtr (SourceForge). LineageOS and Android are trademarks of their respective owners. Not affiliated with Samsung, Google or LineageOS.

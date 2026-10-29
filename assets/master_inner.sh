@@ -2,6 +2,17 @@
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
+# Keep the guest off CPU 0. switch_to_lineage.sh pins watchdogd/logd/adbd/imsd/
+# netd there, so a runaway guest process cannot starve the 100 s host watchdog.
+# Children (zygote, system_server, surfaceflinger, media, apps) inherit this
+# affinity mask.
+NCPU=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+if [ "$NCPU" -gt 1 ]; then
+    GUEST_MASK=$(printf '%x' $(( (1 << NCPU) - 2 )))
+    $BB taskset -p "$GUEST_MASK" $$ 2>/dev/null || taskset -p "$GUEST_MASK" $$ 2>/dev/null || true
+    echo "[Pivoted Root] Guest CPU affinity mask: $GUEST_MASK (CPU 0 reserved for host)"
+fi
+
 echo "[Pivoted Root] Preparing pivot..."
 cd /data/local/tmp/lineage_stage/rootfs
 $BB mount --make-rprivate /
@@ -81,6 +92,36 @@ echo "[Pivoted Root] Starting LineageOS wificond..."
 WIFICOND_PID=$!
 echo "[Pivoted Root] wificond PID: $WIFICOND_PID"
 sleep 1
+
+# Media. switch_to_lineage.sh stopped the whole host media stack so the guest
+# can own media.player/media.c2. Start the GSI's own media.codec and mediaserver:
+# MediaCodecList gets a compatible IMediaCodecList from the guest's
+# MediaPlayerService instead of parsing Samsung's parcel layout in a loop.
+mkdir -p /data/misc/media /data/vendor/media
+chown 1013:1013 /data/misc/media /data/vendor/media 2>/dev/null || true
+chmod 0770 /data/misc/media /data/vendor/media 2>/dev/null || true
+
+start_guest_media() {
+    b="$1"
+    [ -x "$b" ] || return 0
+    name=$(basename "$b")
+    echo "[Pivoted Root] Starting $name..."
+    $BB setuidgid media "$b" > "/data/$name.log" 2>&1 &
+    sleep 1
+    if ! pidof "$name" >/dev/null 2>&1; then
+        echo "[Pivoted Root] $name did not start as media; retrying as root"
+        "$b" > "/data/$name.log" 2>&1 &
+        sleep 1
+    fi
+}
+
+# Metrics/extractor first, then Codec2 and the mediaserver that exposes
+# media.player. The binaries are named after their init services on AOSP.
+start_guest_media /system/bin/mediametrics
+start_guest_media /system/bin/mediaextractor
+start_guest_media /system/bin/media.codec
+start_guest_media /system/bin/mediaresourcemanager
+start_guest_media /system/bin/mediaserver
 
 # Overlay idmaps. idmap2 refuses the GSI's product overlays because framework-res
 # does not declare the targeted resources as overlayable, so OMS ends up with no

@@ -52,6 +52,7 @@ public class MainActivity extends Activity {
     private Button btnReturnOneUI;
     private Button btnBackupLauncher;
     private Button btnRestoreLauncher;
+    private Button btnDiagnose;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -93,6 +94,7 @@ public class MainActivity extends Activity {
         btnReturnOneUI = findViewById(R.id.btn_return_oneui);
         btnBackupLauncher = findViewById(R.id.btn_backup_launcher);
         btnRestoreLauncher = findViewById(R.id.btn_restore_launcher);
+        btnDiagnose = findViewById(R.id.btn_diagnose);
 
         setupFlavorSelection();
         extractAssets();
@@ -104,6 +106,7 @@ public class MainActivity extends Activity {
         btnReturnOneUI.setOnClickListener(v -> returnToOneUI());
         btnBackupLauncher.setOnClickListener(v -> backupLauncher());
         btnRestoreLauncher.setOnClickListener(v -> restoreLauncher());
+        btnDiagnose.setOnClickListener(v -> runDiagnostics());
     }
 
     @Override
@@ -286,6 +289,7 @@ public class MainActivity extends Activity {
             String[] assets = {
                 "switch_to_lineage.sh", "return_to_oneui.sh",
                 "master_prepare.sh", "master_inner.sh",
+                "guest_guard.sh", "preflight.sh",
                 "zygote_exec", "clean_apex_info_list.xml",
                 "services_patched.jar", "framework_patched.jar",
                 "7zz", "PermissionController_patched.apk"
@@ -660,6 +664,42 @@ public class MainActivity extends Activity {
                 appendLog("One UI restore triggered successfully.");
             } catch (Exception e) {
                 appendLog("Restore error: " + e.getMessage());
+                setLogStatus("Error");
+            }
+        });
+    }
+
+    private void runDiagnostics() {
+        if (!isRootGranted) {
+            appendLog("ERROR: Root privilege required to collect diagnostics!");
+            return;
+        }
+        appendLog("\n[DIAG] Collecting device diagnostics...");
+        setLogStatus("Diagnosing…");
+        executor.execute(() -> {
+            try {
+                File filesDir = getFilesDir();
+                String cmd = "mkdir -p " + STAGE_DIR + " && " +
+                             "cp -f \"" + filesDir.getAbsolutePath() + "/preflight.sh\" \"" + STAGE_DIR + "/preflight.sh\" && " +
+                             "chmod 755 \"" + STAGE_DIR + "/preflight.sh\" && " +
+                             "sh \"" + STAGE_DIR + "/preflight.sh\"";
+                Process p = new ProcessBuilder(suBinary, "-c", cmd)
+                        .redirectErrorStream(true).start();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                String line;
+                int lines = 0;
+                while ((line = reader.readLine()) != null) {
+                    if (lines < 140) {
+                        appendLog("  " + line);
+                    }
+                    lines++;
+                }
+                int rc = p.waitFor();
+                appendLog("✓ Diagnostics finished (exit " + rc + ").");
+                appendLog("  Full report: /data/local/tmp/oneLineage_preflight.txt");
+                setLogStatus("Idle");
+            } catch (Exception e) {
+                appendLog("Diagnostics failed: " + e.getMessage());
                 setLogStatus("Error");
             }
         });

@@ -18,6 +18,38 @@ set_prop() {
     fi
 }
 
+# service(1) lives in /system/bin; keep a fallback for ROMs that only expose
+# the `cmd service` form.
+SVC="service"
+command -v service >/dev/null 2>&1 || SVC="/system/bin/service"
+service_list() {
+    $SVC list 2>/dev/null || cmd service list 2>/dev/null
+}
+
+# Reserve CPU 0 for the host's watchdog path and pin the guest to the rest.
+# The media storm is a userspace CPU/binder storm; if watchdogd cannot run for
+# 100 s Samsung's software watchdog panics the kernel. watchdogd sleeps almost
+# all the time, so SCHED_FIFO is safe here.
+protect_host_cpu() {
+    NCPU=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+    [ "$NCPU" -gt 1 ] || return 0
+    HOST_MASK=1
+    if ! pidof watchdogd >/dev/null 2>&1; then
+        setprop ctl.start watchdogd 2>/dev/null || true
+        sleep 1
+    fi
+    for p in watchdogd logd adbd imsd netd; do
+        pid=$(pidof "$p" 2>/dev/null | awk '{print $1}')
+        [ -n "$pid" ] || continue
+        taskset -p "$HOST_MASK" "$pid" 2>/dev/null || $BB taskset -p "$HOST_MASK" "$pid" 2>/dev/null || true
+        renice -n -20 "$pid" 2>/dev/null || $BB renice -n -20 "$pid" 2>/dev/null || true
+        if [ "$p" = "watchdogd" ]; then
+            chrt -f -p 10 "$pid" 2>/dev/null || $BB chrt -f -p 10 "$pid" 2>/dev/null || true
+        fi
+    done
+    echo "Host watchdog path pinned to CPU 0 (watchdogd=$(pidof watchdogd 2>/dev/null))"
+}
+
 BACKUP_DIR="/data/local/tmp/lineage_backups"
 
 echo "=== LINEAGEOS 23.2 TAKEOVER STARTING ==="
@@ -32,6 +64,9 @@ echo "=== LINEAGEOS 23.2 TAKEOVER STARTING ==="
 # return_to_oneui.sh restores enforcing.
 setenforce 0 2>/dev/null || true
 echo "SELinux mode: $(getenforce 2>/dev/null || echo unknown)"
+
+# Keep the host's watchdog path schedulable before the guest starts.
+protect_host_cpu
 
 # --- IMS / SMS REGISTRATION GATE -----------------------------------------
 # The guest has no ImsService of its own, so the modem's IMS registration is
@@ -223,28 +258,51 @@ kill -9 $(pidof zygote64) 2>/dev/null || true
 kill -9 $(pidof system_server) 2>/dev/null || true
 sleep 1
 
-# Stop the HOST media codec stack. The guest's libmedia binds `media.codec` from
-# the shared servicemanager, i.e. Samsung's mediaserver - whose IMediaCodecList
-# AIDL hash differs from the GSI's. The reply parcel is then parsed as garbage
-# ("enforceInterface() expected 'android.gui.IGraphicBufferProducer' but read
-# 'android.media.IMediaCodecList'", "AString: ctor got NULL"), which yields a
-# codec list with a bogus length, so findCodecForFormat -> codecHandlesFormat
-# spins ~2M times inside both system_server and SystemUI, round-tripping to
-# mediaserver each iteration. That is the 125% CPU / constant overheating / GB
-# of logcat. With no media.codec registered the lookup fails fast and the list
-# is empty. Audio is unaffected (audioserver is its own process and is kept).
-# mediaserver must stay UP even though the codec list is unusable: apps play
-# short sounds with MediaPlayer, and MediaPlayer.setDataSource blocks in
-# IMediaDeathNotifier::getMediaPlayerService when "media.player" is missing.
-# That is a 5 s main-thread stall -> ANR -> force-close: Messaging died on every
-# send because of its "sent" sound (playSentSound), and any app doing the same
-# would die too. Keep only the codec processes down, which is what causes the
-# spin described above.
-setprop ctl.start media 2>/dev/null || true
-for svc in media.codec media.metrics; do
-    setprop ctl.stop $svc 2>/dev/null || true
+# --- MEDIA STACK HANDOVER ---
+# The guest's MediaCodecList does NOT ask the `media.codec` service for its
+# codec list. AOSP's MediaCodecList::getRemoteInstance() gets `media.player`
+# (mediaserver) and calls IMediaPlayerService::getCodecList(); MediaPlayerService
+# returns MediaCodecList::getLocalInstance() from the HOST. Keeping mediaserver
+# alive therefore keeps Samsung's incompatible IMediaCodecList alive, and the
+# guest parses it with its own parcel layout until the CPU/watchdog dies.
+# Stop the whole host media stack; master_inner.sh starts the GSI's own
+# media.codec + mediaserver after pivot_root, so media.player/media.c2 are
+# compatible with the guest and MediaPlayer still has a working service.
+for svc in media media.codec media.extractor media.metrics media.resource_manager; do
+    setprop ctl.stop "$svc" 2>/dev/null || true
 done
-kill -9 $(pidof media.codec) $(pidof media.metrics) 2>/dev/null || true
+for p in media mediaserver media.codec mediaextractor mediametrics mediaresourcemanager; do
+    kill -9 $(pidof "$p") 2>/dev/null || true
+done
+
+# Wait until the service names are actually gone. If a host mediaserver is still
+# registered, the guest's mediaserver cannot claim media.player and falls back
+# to the incompatible host list again.
+i=0
+while [ $i -lt 50 ]; do
+    service_list | grep -qE 'media\.(player|codec|c2|extractor|metrics|resource_manager)' || break
+    i=$((i+1))
+    sleep 0.1
+done
+if service_list | grep -qE 'media\.(player|codec|c2|extractor|metrics|resource_manager)'; then
+    echo "WARNING: host media services still registered after stop:"
+    service_list | grep -E 'media\.(player|codec|c2|extractor|metrics|resource_manager)' || true
+fi
+
+# Keep Samsung init from resurrecting the host media stack while Lineage owns
+# the service names. The guest's mediaserver is not an init service, so this
+# loop only affects the host.
+nohup $BB sh -c '
+  # onelineage_media_suppress
+  while true; do
+    for svc in media media.codec media.extractor media.metrics media.resource_manager; do
+      [ "$(getprop init.svc.$svc)" = "running" ] && setprop ctl.stop "$svc"
+    done
+    sleep 1
+  done
+' </dev/null >/dev/null 2>&1 &
+echo $! > "$STAGE/media_suppress.pid"
+echo "Host media stack stopped; guest media stack will start after pivot."
 
 # Same handover for wifi. The guest's WifiService binds IWificond (service
 # "wifinl80211") and drives the vendor HAL through it. Samsung's wificond is
@@ -267,16 +325,39 @@ cp -f "$STAGE/zygote_exec" "$STAGE/data/zygote_exec"
 chmod 755 "$STAGE/data/zygote_exec"
 
 # Launch takeover inside isolated mount namespace
+# Kill leftovers from a previous session, then clear per-session health flags.
+pkill -9 -f "guest_guard.sh" 2>/dev/null || true
+pkill -9 -f "onelineage_media_suppress" 2>/dev/null || true
+rm -f "$STAGE/ui_ready" "$STAGE/guard_triggered" "$STAGE/stop_guard" "$STAGE/media_suppress.pid"
+
 $BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
 TAKEOVER_PID=$!
 echo "Takeover daemon PID: $TAKEOVER_PID"
+
+# Start the host-side guard. It watches the guest's log rate, dmesg watchdog
+# warnings and the UI-ready deadline, and rolls back to One UI before Samsung's
+# 100 s watchdog can panic the kernel.
+if [ -f "$STAGE/guest_guard.sh" ]; then
+    chmod 755 "$STAGE/guest_guard.sh" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh "$STAGE/guest_guard.sh" </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh "$STAGE/guest_guard.sh" </dev/null >/dev/null 2>&1 &
+    fi
+    echo "Guest health guard started."
+else
+    echo "WARNING: guest_guard.sh missing; no automatic rollback on media storm."
+fi
 
 # Start UI Activator daemon
 $BB sh -c "
 BB=\"$BB\"
 [ -n \"\$BB\" ] || BB=\$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
-while true; do
+i=0
+while [ \$i -lt 45 ]; do
+    i=\$((i + 1))
     sleep 2
+    [ -f \"\$STAGE/guard_triggered\" ] && { echo '[UI Activator] Guard triggered; exiting.'; break; }
     PID=\$(pidof system_server | awk '{print \$1}')
     if [ -n \"\$PID\" ]; then
         if $BB nsenter -t \$PID -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'; then
@@ -300,6 +381,7 @@ while true; do
             $BB nsenter -t \$PID -m /system/bin/am unlock-user 0
             $BB nsenter -t \$PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME
             echo '[UI Activator] Home activated!'
+            echo ok > \"\$STAGE/ui_ready\"
             echo '[UI Activator] Creating missing app data dirs...'
             $BB nsenter -t \$PID -m /system/bin/sh /data/local/tmp/fix_app_dirs.sh 2>/dev/null || true
 
@@ -335,6 +417,10 @@ while true; do
         fi
     fi
 done
+if [ \$i -ge 45 ]; then
+    echo '[UI Activator] Timeout waiting for WindowManager; rolling back.'
+    /system/bin/sh \"\$STAGE/return_to_oneui.sh\"
+fi
 " </dev/null >/data/local/tmp/ui_activator.log 2>&1 &
 
 echo "=== TAKEOVER LAUNCHED SUCCESSFULLY ==="

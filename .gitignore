@@ -2,3 +2,4 @@ build/
 keystore/
 backups_*/
 *.idsig
+OneLineage-*.apk
