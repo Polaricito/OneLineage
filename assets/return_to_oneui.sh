@@ -148,7 +148,7 @@ echo "=== [5/6] Starting One UI Display & Host Services ==="
 # Start everything that does not need the watchdog first. zygote is started
 # last because the host system_server is the only process that can feed
 # /dev/watchdog1, and the softdog kicker is still holding it.
-for svc in surfaceflinger audioserver cameraserver; do
+for svc in surfaceflinger audioserver cameraserver vendor.fps_hal sec-biometrics-face-aidl; do
     setprop ctl.start "$svc" 2>/dev/null || true
 done
 
@@ -234,4 +234,14 @@ echo "One UI restored successfully."
 if [ -w /sys/power/wake_unlock ]; then
     echo "onelineage_takeover" > /sys/power/wake_unlock 2>/dev/null && \
         echo "Wake lock released (One UI is up)"
+fi
+
+# Restore USB-only adb. The TCP fallback was a takeover-only safety net; a
+# listener left behind on the home Wi-Fi would expose adb after One UI is back.
+if [ "$(getprop service.adb.tcp.port)" = "5555" ]; then
+    setprop service.adb.tcp.port "" 2>/dev/null || true
+    setprop ctl.stop adbd 2>/dev/null || true
+    $BB sleep 1
+    setprop ctl.start adbd 2>/dev/null || true
+    echo "ADB TCP fallback disabled (USB only)"
 fi

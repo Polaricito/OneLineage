@@ -96,6 +96,22 @@ fi
 # Keep the host's watchdog path schedulable before the guest starts.
 protect_host_cpu
 
+# --- ADB TCP FALLBACK -----------------------------------------------------
+# The guest's system_server reconfigures the USB gadget during boot and the
+# host adbd can end up with a dead /dev/usb-ffs/adb/ep0 even though init still
+# reports it as running. USB alone is then a single point of failure: without a
+# shell there is no way to read logs or trigger a clean rollback. Keep a second
+# channel over Wi-Fi. adbd listens on this port whenever it starts, so a
+# watchdog restart re-creates the TCP listener even if USB is broken.
+if [ "$(getprop service.adb.tcp.port)" != "5555" ]; then
+    setprop service.adb.tcp.port 5555 2>/dev/null || true
+    setprop ctl.stop adbd 2>/dev/null || true
+    sleep 1
+    setprop ctl.start adbd 2>/dev/null || true
+    sleep 2
+    echo "ADB TCP fallback enabled on port 5555 (ip: $(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | head -1 | cut -d' ' -f2))"
+fi
+
 # --- SOFTDOG FEEDER -------------------------------------------------------
 # The HOST system_server is the only process that pings Samsung's software
 # watchdog (/dev/watchdog1, soft_margin=100 soft_panic=1). We are about to kill
@@ -156,22 +172,41 @@ if ! ps -ef 2>/dev/null | grep -v grep | grep -q "adb_watchdog.sh"; then
     cat > /data/local/tmp/adb_watchdog.sh <<'ADBW'
 #!/system/bin/sh
 # Watchdog for the host adbd, which is the only way into the phone while Lineage
-# is up. Two failure modes are handled:
-#   1. adbd simply died -> ask init to start it again.
-#   2. adbd is alive but the USB gadget lost the adb function. The guest's own
-#      UsbService rewrites sys.usb.config during boot, and a plain setprop is a
-#      no-op in that state, so the gadget has to be re-applied by toggling it.
+# is up. Failure modes handled:
+#   1. the host adbd died -> ask init to start it again;
+#   2. the guest started its own adbd inside the container namespace and the two
+#      fight over /dev/usb-ffs/adb/ep0 (observed 2026-10-29: the guest adbd kept
+#      logging "transport endpoint shutdown" and the PC saw an offline device
+#      with no serial) -> kill the guest adbd, keep the host one;
+#   3. the USB gadget lost the adb function -> re-apply it;
+#   4. USB is unusable -> the TCP fallback on service.adb.tcp.port=5555 still
+#      gives a shell over Wi-Fi, and a restarted adbd re-creates that listener.
 LOG=/data/local/tmp/adb_watchdog.log
+SELF_NS=$(readlink /proc/self/ns/mnt 2>/dev/null)
 last_toggle=0
+echo "$(date) adb watchdog started (ns=$SELF_NS, tcp=$(getprop service.adb.tcp.port))" >> "$LOG"
 while true; do
-    sleep 10
+    sleep 5
+    host_adbd=""
+    for p in $(pidof adbd 2>/dev/null); do
+        pns=$(readlink "/proc/$p/ns/mnt" 2>/dev/null)
+        [ -n "$pns" ] || continue
+        if [ -n "$SELF_NS" ] && [ "$pns" != "$SELF_NS" ]; then
+            kill -9 "$p" 2>/dev/null && echo "$(date) killed guest adbd $p" >> "$LOG"
+        else
+            host_adbd="$p"
+        fi
+    done
     st=$(getprop init.svc.adbd)
     usb=$(getprop sys.usb.state)
     cfg=$(getprop sys.usb.config)
-    if [ "$st" != "running" ]; then
+    if [ -z "$host_adbd" ]; then
         setprop ctl.start adbd 2>/dev/null
-        echo "$(date) restarted adbd (was: $st, usb.state=$usb, usb.config=$cfg)" >> "$LOG"
+        echo "$(date) host adbd missing; started (svc=$st usb.state=$usb usb.config=$cfg)" >> "$LOG"
     fi
+    # Re-assert the TCP port so any adbd restart also re-creates the Wi-Fi
+    # listener. This does not disturb a running adbd.
+    [ "$(getprop service.adb.tcp.port)" = "5555" ] || setprop service.adb.tcp.port 5555 2>/dev/null
     case "$cfg" in
         *adb*) ;;
         *)
@@ -185,7 +220,7 @@ while true; do
             ;;
         *)
             now=$(date +%s 2>/dev/null || echo 0)
-            if [ $((now - last_toggle)) -gt 300 ]; then
+            if [ $((now - last_toggle)) -gt 60 ]; then
                 last_toggle=$now
                 echo "$(date) gadget lost adb, toggling (state: $usb, config: $cfg)" >> "$LOG"
                 setprop sys.usb.config none 2>/dev/null
@@ -409,6 +444,20 @@ nohup $BB sh -c '
 echo $! > "$STAGE/media_suppress.pid"
 echo "Host media stack stopped; guest media stack will start after pivot."
 
+# --- BIOMETRIC TEE GUARD ---
+# The guest's GSI FingerprintService binds the host's vendor HAL and calls
+# setActiveUser(0) with the guest's own gatekeeper SID. The fingerprint TA keys
+# its templates by that SID, so a guest session can invalidate the host's
+# enrolled fingerprints (observed 2026-10-29: One UI asked to re-enrol after the
+# guest ran). The guest does not need biometrics, so stop both vendor HALs for
+# the session and restart them before host zygote in return_to_oneui.sh.
+for svc in vendor.fps_hal sec-biometrics-face-aidl; do
+    setprop ctl.stop "$svc" 2>/dev/null || true
+done
+pkill -9 -f "vendor.samsung.hardware.biometrics.fingerprint@3.0-service" 2>/dev/null || true
+pkill -9 -f "vendor.samsung.hardware.biometrics.face-service" 2>/dev/null || true
+echo "Host biometric HALs stopped (TEE templates protected)"
+
 # Same handover for wifi. The guest's WifiService binds IWificond (service
 # "wifinl80211") and drives the vendor HAL through it. Samsung's wificond is
 # still holding the client interface that One UI's (now dead) WifiService
@@ -548,10 +597,19 @@ while [ \$i -lt 100 ]; do
             # The system may restart a launcher that crashed during unlock. Keep
             # retrying Home until a launcher process survives two samples.
             l=0
+            FOUND=
             while [ \$l -lt 12 ]; do
-                if $BB nsenter -t \$PID -m /system/bin/pidof droid.launcher3 >/dev/null 2>&1; then
+                # pidof matches the 15-char comm, which is not stable across
+                # launcher builds (this one is com.android.launcher3, comm
+                # "com.android.lau" or "droid.launcher3"). Match the full
+                # cmdline instead, and require the process to survive two
+                # samples.
+                if $BB nsenter -t \$PID -m /system/bin/ps -A -o NAME,ARGS 2>/dev/null | grep -q 'com.android.launcher3'; then
                     sleep 3
-                    $BB nsenter -t \$PID -m /system/bin/pidof droid.launcher3 >/dev/null 2>&1 && break
+                    if $BB nsenter -t \$PID -m /system/bin/ps -A -o NAME,ARGS 2>/dev/null | grep -q 'com.android.launcher3'; then
+                        FOUND=1
+                        break
+                    fi
                 fi
                 l=\$((l + 1))
                 echo \"[UI Activator] launcher not running; retry \$l/12\"
@@ -559,6 +617,11 @@ while [ \$i -lt 100 ]; do
                 sleep 5
                 $BB nsenter -t \$PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null || true
             done
+            if [ -z \"\$FOUND\" ]; then
+                echo '[UI Activator] launcher never survived; rolling back.'
+                /system/bin/sh \"\$STAGE/return_to_oneui.sh\"
+                break
+            fi
             echo \"[UI Activator] Home activated (launcher retries=\$l)!\"
             echo ok > \"\$STAGE/ui_ready\"
 

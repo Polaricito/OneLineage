@@ -171,7 +171,10 @@ while true; do
     # help. A *slow* boot, however, is normal on this eMMC (load average ~15),
     # and rolling back a healthy guest is worse than waiting: the storm check
     # above is what protects the watchdog, and the guest is pinned off CPU 0.
-    if [ "$ELAPSED" -gt 150 ] && ! guest_system_server; then
+    # The previous successful run needed between 150s and 233s for system_server
+    # to appear; 300s gives ample margin without risking the softdog (the kicker
+    # feeds independently every 10s).
+    if [ "$ELAPSED" -gt 300 ] && ! guest_system_server; then
         rollback "guest system_server is not running after ${ELAPSED}s"
     fi
     # The UI activator waits up to 200 s for WindowManager, then up to 180 s
