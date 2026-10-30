@@ -185,26 +185,28 @@ mkdir -p "$STAGE/data/system/users/0" "$STAGE/data/system_de/0/spblob" "$STAGE/d
 mkdir -p "$STAGE/data/misc/user/0" "$STAGE/data/misc_de/0" "$STAGE/data/misc_ce/0"
 mkdir -p "$STAGE/data/anr" "$STAGE/data/app" "$STAGE/data/rollback" "$STAGE/data/incremental"
 
-for pkg in com.android.providers.settings \
-           com.android.providers.telephony \
-           com.android.phone \
-           com.android.systemui \
-           com.android.settings \
-           com.android.launcher3 \
-           com.android.inputmethod.latin \
-           com.android.providers.media \
-           com.android.providers.downloads \
-           com.android.providers.contacts \
-           com.android.providers.calendar \
-           org.lineageos.lineagesettings \
-           com.wewaffles.onelineage; do
-    mkdir -p "$STAGE/data/user_de/0/$pkg/databases" \
-             "$STAGE/data/user_de/0/$pkg/shared_prefs" \
-             "$STAGE/data/user_de/0/$pkg/files/datastore/education" \
-             "$STAGE/data/user/0/$pkg/databases" \
-             "$STAGE/data/user/0/$pkg/shared_prefs" \
-             "$STAGE/data/user/0/$pkg/files"
-done
+# Do NOT pre-create every app dir with a blanket system:system owner. PMS asks
+# installd to prepare each package's data dir with the package's own uid, and
+# prepareAppData fails when the dir already exists with the wrong owner:
+#   Expected path /data/user_de/0/com.android.launcher3 with owner 10131:10131
+#   but found 1000:1000
+# That made the launcher crash on its first launch (resolveActivity(HOME)
+# returned null while PMS was recovering). Use packages.list from the previous
+# guest boot to create/realign every known app dir with the uid PMS expects.
+# On a true first boot packages.list is absent; leave the dirs to PMS/installd
+# and fix_app_dirs.sh will sweep them once the framework is up.
+if [ -f "$STAGE/data/system/packages.list" ]; then
+    while read -r pkg auid rest; do
+        case "$auid" in ''|*[!0-9]*) continue ;; esac
+        for pair in "$STAGE/data/user/0/$pkg:0771" "$STAGE/data/user_de/0/$pkg:0700"; do
+            p=${pair%:*}; mode=${pair##*:}
+            mkdir -p "$p" 2>/dev/null || continue
+            $BB chown "$auid:$auid" "$p" 2>/dev/null || true
+            $BB chmod "$mode" "$p" 2>/dev/null || true
+        done
+    done < "$STAGE/data/system/packages.list"
+    echo "Realigned staged app data dirs from packages.list"
+fi
 
 mkdir -p "$STAGE/data/resource-cache"
 chmod 771 "$STAGE/data/resource-cache"
@@ -213,9 +215,16 @@ chown 1000:1000 "$STAGE/data/resource-cache"
 rm -rf "$STAGE/data/data" 2>/dev/null || true
 mkdir -p "$STAGE/data/data"
 
-chmod -R 777 "$STAGE/data/user" "$STAGE/data/user_de" "$STAGE/data/misc" "$STAGE/data/misc_de" "$STAGE/data/misc_ce" "$STAGE/data/system" "$STAGE/data/system_de" "$STAGE/data/system_ce" "$STAGE/data/anr" "$STAGE/data/data" 2>/dev/null || true
-chown -R 1000:1000 "$STAGE/data/system" "$STAGE/data/system_de" "$STAGE/data/system_ce" "$STAGE/data/user" "$STAGE/data/user_de" "$STAGE/data/misc" "$STAGE/data/misc_de" "$STAGE/data/misc_ce" 2>/dev/null || true
-chown -R 10109:10109 "$STAGE/data/user_de/0/com.android.inputmethod.latin" "$STAGE/data/user/0/com.android.inputmethod.latin" 2>/dev/null || true
+# Top-level storage dirs are system:system, but app dirs keep the package uids
+# set above. Recursively chowning user/user_de to 1000 is exactly what broke
+# launcher/systemui data preparation.
+chmod -R 777 "$STAGE/data/misc" "$STAGE/data/misc_de" "$STAGE/data/misc_ce" "$STAGE/data/system" "$STAGE/data/system_de" "$STAGE/data/system_ce" "$STAGE/data/anr" "$STAGE/data/data" 2>/dev/null || true
+chown -R 1000:1000 "$STAGE/data/system" "$STAGE/data/system_de" "$STAGE/data/system_ce" "$STAGE/data/misc" "$STAGE/data/misc_de" "$STAGE/data/misc_ce" 2>/dev/null || true
+for d in "$STAGE/data/user" "$STAGE/data/user_de" "$STAGE/data/user/0" "$STAGE/data/user_de/0"; do
+    [ -d "$d" ] || continue
+    $BB chown 1000:1000 "$d" 2>/dev/null || true
+    $BB chmod 0771 "$d" 2>/dev/null || true
+done
 
 # Create the bluetooth stack's storage before the guest ever starts. The GSI's
 # GD stack asserts out of storage_module.cc if it cannot persist bt_config.conf,
@@ -231,6 +240,21 @@ chmod 0770 "$STAGE/data/misc/bluedroid" "$STAGE/data/misc/bluetooth" 2>/dev/null
 mkdir -p "$STAGE/data/misc/media" "$STAGE/data/vendor/media" 2>/dev/null || true
 chown 1013:1013 "$STAGE/data/misc/media" "$STAGE/data/vendor/media" 2>/dev/null || true
 chmod 0770 "$STAGE/data/misc/media" "$STAGE/data/vendor/media" 2>/dev/null || true
+
+# Fingerprint HAL storage. The guest's FingerprintUpdateActiveUserClient
+# failed with "Cannot make directory: /data/vendor_de/0/fpdata" 39k times in
+# one boot because the staged /data had no vendor_de at all. Replicate the
+# host layout and labels. The parents stay root:root 0551/0771 (same as the
+# host); fpdata is system:system 0700 so the guest system_server can use it.
+mkdir -p "$STAGE/data/vendor_de/0/fpdata" 2>/dev/null || true
+$BB chown 0:0 "$STAGE/data/vendor_de" "$STAGE/data/vendor_de/0" 2>/dev/null || true
+$BB chmod 0551 "$STAGE/data/vendor_de" 2>/dev/null || true
+$BB chmod 0771 "$STAGE/data/vendor_de/0" 2>/dev/null || true
+$BB chown 1000:1000 "$STAGE/data/vendor_de/0/fpdata" 2>/dev/null || true
+$BB chmod 0700 "$STAGE/data/vendor_de/0/fpdata" 2>/dev/null || true
+$BB chcon u:object_r:vendor_userdir_file:s0 "$STAGE/data/vendor_de" 2>/dev/null || true
+$BB chcon u:object_r:vendor_data_file:s0 "$STAGE/data/vendor_de/0" 2>/dev/null || true
+$BB chcon u:object_r:fingerprint_vendor_data_file:s0 "$STAGE/data/vendor_de/0/fpdata" 2>/dev/null || true
 
 # SELinux labels matter just as much as modes here. Every directory below lives
 # under /data/local/tmp, so it is created as u:object_r:shell_data_file:s0. The

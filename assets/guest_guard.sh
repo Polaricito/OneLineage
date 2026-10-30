@@ -26,6 +26,18 @@ DMESG=/system/bin/dmesg
 # sleeping, so this costs nothing and keeps its samples responsive under load.
 $BB taskset -p 1 $$ 2>/dev/null || taskset -p 1 $$ 2>/dev/null || true
 
+# Idempotently re-assert the headless wake lock. switch_to_lineage.sh takes it
+# before stopping One UI, but the guard is the component that lives for the
+# whole session; re-taking it here means a takeover launched without the
+# orchestrator still cannot suspend the device mid-boot. Check first: writing
+# the name twice registers two wakeup sources and the single unlock in
+# return_to_oneui.sh would leave one behind.
+if [ -w /sys/power/wake_lock ]; then
+    if ! $BB grep -q onelineage_takeover /sys/power/wake_lock 2>/dev/null; then
+        echo "onelineage_takeover" > /sys/power/wake_lock 2>/dev/null || true
+    fi
+fi
+
 say() {
     echo "$($BB date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
 }
@@ -78,13 +90,19 @@ protect_host() {
     done
 }
 
-# Count matching lines in the most recent logcat window. This intentionally
+# Count matching lines in the most recent guest log window. This intentionally
 # looks at saturation instead of a cumulative count: when the guest is spinning,
 # the tail of every buffer is made of these lines. Three consecutive samples
 # (about 6 s) trigger the rollback.
+#
+# Read the rotating file that master_inner.sh captures instead of running
+# `logcat -d -t 2000`: under a binder/CPU storm logcat itself can block, which
+# would freeze the guard exactly when it is needed. tail(1) on a 4 MB file is
+# bounded and cannot hang on a dead logd.
 storm_count() {
-    $LOGCAT -b all -d -t 2000 2>/dev/null | \
-        $BB grep -cE 'MediaCodecList|codecHandlesFormat|AString: ctor got NULL'
+    [ -f "$STAGE/data/guest_logcat.log" ] || { echo 0; return; }
+    $BB tail -n 2000 "$STAGE/data/guest_logcat.log" 2>/dev/null | \
+        $BB grep -cE 'MediaCodecList|codecHandlesFormat|AString: ctor NULL|AString: ctor got NULL'
 }
 
 say "guard started (pid $$)"
@@ -92,6 +110,26 @@ START=$($BB date +%s)
 protect_host
 BAD=0
 TICK=0
+
+# The softdog feeder is the only thing keeping the kernel alive after the host
+# system_server dies. If it crashed, restart it: the guard is the long-lived
+# component and can do that without the orchestrator.
+check_kicker() {
+    kpid=$($BB cat "$STAGE/softdog_kicker.pid" 2>/dev/null)
+    if [ -n "$kpid" ] && kill -0 "$kpid" 2>/dev/null; then
+        return 0
+    fi
+    [ -f "$STAGE/stop_softdog_kicker" ] && return 0
+    say "WARNING: softdog kicker is not running; restarting it"
+    rm -f "$STAGE/stop_softdog_kicker"
+    if [ -x "$STAGE/softdog_kicker.sh" ]; then
+        if command -v setsid >/dev/null 2>&1; then
+            setsid /system/bin/sh "$STAGE/softdog_kicker.sh" </dev/null >/dev/null 2>&1 &
+        else
+            nohup /system/bin/sh "$STAGE/softdog_kicker.sh" </dev/null >/dev/null 2>&1 &
+        fi
+    fi
+}
 
 while true; do
     $BB sleep 2
@@ -116,11 +154,6 @@ while true; do
         protect_host
     fi
 
-    if $DMESG 2>/dev/null | $BB tail -n 200 | \
-        $BB grep -qiE 'watchdog: BUG|watchdog timer expired|watchdog did not stop|softdog: .*failed|BUG: soft lockup'; then
-        rollback "host watchdog/soft-lockup warning in dmesg"
-    fi
-
     STORM=$(storm_count)
     [ -n "$STORM" ] || STORM=0
     if [ "$STORM" -gt 900 ]; then
@@ -138,17 +171,34 @@ while true; do
     # help. A *slow* boot, however, is normal on this eMMC (load average ~15),
     # and rolling back a healthy guest is worse than waiting: the storm check
     # above is what protects the watchdog, and the guest is pinned off CPU 0.
-    if [ "$ELAPSED" -gt 75 ] && ! guest_system_server; then
+    if [ "$ELAPSED" -gt 150 ] && ! guest_system_server; then
         rollback "guest system_server is not running after ${ELAPSED}s"
     fi
-    # The UI activator waits up to 200 s (100 x 2 s) for WindowManager on this
-    # slow eMMC. Keep the guard deadline above it, or a healthy boot gets rolled
-    # back while the activator is still waiting.
-    if [ "$ELAPSED" -gt 240 ] && [ ! -f "$UI_READY" ]; then
+    # The UI activator waits up to 200 s for WindowManager, then up to 180 s
+    # for boot completion, a 15 s settle, and up to 96 s of launcher retries on
+    # this slow eMMC. The softdog kicker keeps the kernel alive independently,
+    # so a long boot is safe; only roll back after the activator's full budget.
+    if [ "$ELAPSED" -gt 480 ] && [ ! -f "$UI_READY" ]; then
         rollback "guest UI not ready after ${ELAPSED}s"
     fi
 
     if [ $((TICK % 15)) -eq 0 ]; then
+        # Bound every dmesg read. The kernel log is 2 MB on this device and
+        # dmesg can block in klogctl when the kernel is under stress; an
+        # unbounded read froze the guard during a previous media storm.
+        if $BB timeout -s KILL 5 $DMESG 2>/dev/null | $BB tail -n 200 | \
+            $BB grep -qiE 'watchdog: BUG|watchdog timer expired|watchdog did not stop|softdog: .*failed|BUG: soft lockup'; then
+            rollback "host watchdog/soft-lockup warning in dmesg"
+        fi
+        check_kicker
+        # Re-assert the headless wake lock. If anything released it (e.g. an
+        # older rollback path), the next suspend would stop the softdog timer
+        # and panic the kernel ~100 s later.
+        if [ -w /sys/power/wake_lock ] && \
+           ! $BB grep -q onelineage_takeover /sys/power/wake_lock 2>/dev/null; then
+            echo "onelineage_takeover" > /sys/power/wake_lock 2>/dev/null || true
+            say "re-acquired takeover wake lock"
+        fi
         if [ -f "$UI_READY" ]; then
             say "alive: ${ELAPSED}s, storm=${STORM}, ui=ready"
         else

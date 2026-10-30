@@ -316,7 +316,7 @@ public class MainActivity extends Activity {
             String[] assets = {
                 "switch_to_lineage.sh", "return_to_oneui.sh",
                 "master_prepare.sh", "master_inner.sh",
-                "guest_guard.sh", "preflight.sh",
+                "guest_guard.sh", "preflight.sh", "softdog_kicker.sh",
                 "zygote_exec", "clean_apex_info_list.xml",
                 "services_patched.jar", "framework_patched.jar",
                 "7zz", "PermissionController_patched.apk"

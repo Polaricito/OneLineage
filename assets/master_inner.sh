@@ -149,6 +149,60 @@ mkdir -p /data/misc/media /data/vendor/media
 chown 1013:1013 /data/misc/media /data/vendor/media 2>/dev/null || true
 chmod 0770 /data/misc/media /data/vendor/media 2>/dev/null || true
 
+# Fingerprint HAL storage (fallback for an older stage tree). The guest's
+# FingerprintUpdateActiveUserClient calls mkdirs() on /data/vendor_de/0/fpdata
+# and used to flood the log 39k times per boot when the tree was missing.
+mkdir -p /data/vendor_de/0/fpdata 2>/dev/null || true
+chown 0:0 /data/vendor_de /data/vendor_de/0 2>/dev/null || true
+chmod 0551 /data/vendor_de 2>/dev/null || true
+chmod 0771 /data/vendor_de/0 2>/dev/null || true
+chown 1000:1000 /data/vendor_de/0/fpdata 2>/dev/null || true
+chmod 0700 /data/vendor_de/0/fpdata 2>/dev/null || true
+$BB chcon u:object_r:vendor_userdir_file:s0 /data/vendor_de 2>/dev/null || true
+$BB chcon u:object_r:vendor_data_file:s0 /data/vendor_de/0 2>/dev/null || true
+$BB chcon u:object_r:fingerprint_vendor_data_file:s0 /data/vendor_de/0/fpdata 2>/dev/null || true
+
+# The GSI's /system/etc/passwd and /system/etc/group are empty (0 bytes), so
+# busybox setuidgid cannot resolve "media"/"mediaex"/"mediacodec"/"audioserver"
+# inside the guest and every media/audio daemon fails to start. Bind a real
+# passwd/group over the empty files. Android uids: media=1013, mediaex=1040,
+# mediacodec=1046, audioserver=1047; audioserver's primary group is audio=1005.
+cat > /data/guest_passwd <<'EOF'
+root:x:0:0:root:/:/system/bin/sh
+system:x:1000:1000:system:/:/system/bin/sh
+media:x:1013:1013:media:/:/system/bin/sh
+mediaex:x:1040:1040:mediaex:/:/system/bin/sh
+mediacodec:x:1046:1046:mediacodec:/:/system/bin/sh
+audioserver:x:1047:1005:audioserver:/:/system/bin/sh
+shell:x:2000:2000:shell:/:/system/bin/sh
+EOF
+cat > /data/guest_group <<'EOF'
+root:x:0:
+system:x:1000:
+media:x:1013:
+mediaex:x:1040:
+mediacodec:x:1046:
+audioserver:x:1047:
+shell:x:2000:
+audio:x:1005:
+camera:x:1006:
+drmrpc:x:1026:
+mediadrm:x:1057:
+inet:x:3003:
+net_bt:x:3002:
+net_bt_admin:x:3001:
+net_bw_acct:x:3004:
+EOF
+$BB mount -o bind /data/guest_passwd /system/etc/passwd 2>/dev/null || \
+    $BB mount --bind /data/guest_passwd /system/etc/passwd 2>/dev/null || true
+$BB mount -o bind /data/guest_group /system/etc/group 2>/dev/null || \
+    $BB mount --bind /data/guest_group /system/etc/group 2>/dev/null || true
+if $BB grep -q '^media:' /system/etc/passwd 2>/dev/null; then
+    echo "[Pivoted Root] Guest passwd bound (media=1013, mediaex=1040, mediacodec=1046)"
+else
+    echo "[Pivoted Root] WARNING: guest passwd bind failed; media will run as root"
+fi
+
 start_guest_media() {
     b="$1"
     user="$2"
@@ -160,17 +214,21 @@ start_guest_media() {
     name=$(basename "$b")
     echo "[Pivoted Root] Starting $pname ($b) as $user..."
     $BB setuidgid "$user" "$b" > "/data/$name.log" 2>&1 &
-    sleep 1
-    running=0
-    pidof "$pname" >/dev/null 2>&1 && running=1
-    if [ "$running" -eq 0 ]; then
-        echo "[Pivoted Root] $pname did not start as $user; retrying as root"
-        echo "setuidgid $user failed, retrying as root" >> "/data/$name.log"
-        "$b" >> "/data/$name.log" 2>&1 &
-        sleep 1
-        if ! pidof "$pname" >/dev/null 2>&1; then
-            echo "[Pivoted Root] WARNING: $pname is not running; see /data/$name.log"
-        fi
+    mpid=$!
+    sleep 2
+    if kill -0 "$mpid" 2>/dev/null; then
+        echo "[Pivoted Root] $pname started as $user (pid $mpid)"
+        return 0
+    fi
+    echo "[Pivoted Root] $pname exited as $user (pid $mpid); retrying as root"
+    echo "setuidgid $user failed, retrying as root" >> "/data/$name.log"
+    "$b" >> "/data/$name.log" 2>&1 &
+    mpid=$!
+    sleep 2
+    if kill -0 "$mpid" 2>/dev/null; then
+        echo "[Pivoted Root] $pname started as root (pid $mpid)"
+    else
+        echo "[Pivoted Root] WARNING: $pname is not running; see /data/$name.log"
     fi
 }
 
@@ -191,10 +249,37 @@ start_guest_media /system/bin/mediaserver64 media mediaserver
 # media.player is the service the framework asks for its codec list. If it did
 # not come up, MediaCodecList falls back to a remote call on a dead/foreign
 # service and the boot storm starts. Make the failure loud in the log.
-if ! pidof mediaserver >/dev/null 2>&1; then
+if ! pidof mediaserver64 >/dev/null 2>&1 && ! pidof mediaserver >/dev/null 2>&1; then
     echo "[Pivoted Root] WARNING: mediaserver (mediaserver64) is not running; media.player is unavailable"
     echo "[Pivoted Root] mediaserver64 log:"
     tail -n 20 /data/mediaserver64.log 2>/dev/null
+fi
+
+# Audio. switch_to_lineage.sh stops the host audioserver in the media handover,
+# and the guest AudioService waits on media.audiopolicy with no timeout, so the
+# GSI audioserver must be registered before zygote starts system_server. Run it
+# as audioserver (1047) with primary group audio (1005), matching init.rc.
+if [ -x /system/bin/audioserver ]; then
+    echo "[Pivoted Root] Starting LineageOS audioserver..."
+    $BB setuidgid audioserver /system/bin/audioserver > /data/audioserver.log 2>&1 &
+    APID=$!
+    sleep 2
+    if kill -0 "$APID" 2>/dev/null; then
+        echo "[Pivoted Root] audioserver started as audioserver (pid $APID)"
+    else
+        echo "[Pivoted Root] audioserver exited as audioserver; retrying as root"
+        echo "setuidgid audioserver failed, retrying as root" >> /data/audioserver.log
+        /system/bin/audioserver >> /data/audioserver.log 2>&1 &
+        APID=$!
+        sleep 2
+        if kill -0 "$APID" 2>/dev/null; then
+            echo "[Pivoted Root] audioserver started as root (pid $APID)"
+        else
+            echo "[Pivoted Root] WARNING: audioserver is not running; see /data/audioserver.log"
+        fi
+    fi
+else
+    echo "[Pivoted Root] WARNING: /system/bin/audioserver missing"
 fi
 
 # Overlay idmaps. idmap2 refuses the GSI's product overlays because framework-res
@@ -250,6 +335,17 @@ echo "[Pivoted Root] Host zygote service: $(getprop init.svc.zygote 2>/dev/null 
 rm -f /dev/socket/zygote /dev/socket/usap_pool_primary 2>/dev/null || true
 
 echo "[Pivoted Root] Launching LineageOS Zygote & SystemServer via zygote_exec..."
+# Capture the guest framework's logcat. The guest shares /dev with the host, so
+# liblog writes to the host logd socket and this GSI logcat reads the same
+# buffers. Without it, Trebuchet/system_server crashes only show up as a dead
+# process with no stack.
+if [ -x /system/bin/logcat ]; then
+    # Rotate: 2 x 4 MB instead of a 75 MB unbounded file. The guard tails this
+    # file for media storms, and the previous capture filled /data.
+    rm -f /data/guest_logcat.log /data/guest_logcat.log.1 /data/guest_logcat.log.2 2>/dev/null || true
+    /system/bin/logcat -b all -v threadtime -r 4096 -n 2 -f /data/guest_logcat.log &
+    echo "[Pivoted Root] guest logcat PID: $! (rotating 2x4MB)"
+fi
 # zygote_exec redirects its own stdio to /data/zygote_stderr.log (patched from
 # /dev/null so an execve/linker failure is no longer silent). Create/truncate it
 # first: the binary opens it O_RDWR without O_CREAT.

@@ -6,14 +6,10 @@ LOG="$STAGE/guest_guard.log"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
-# Release the takeover wake lock if we're rolling back.
-# switch_to_lineage.sh acquires "onelineage_takeover" via /sys/power/wake_lock
-# to prevent suspend during the headless window. If rollback is triggered
-# independently (e.g. by guest_guard.sh), we must release it here too.
-if [ -w /sys/power/wake_unlock ]; then
-    echo "onelineage_takeover" > /sys/power/wake_unlock 2>/dev/null && \
-        echo "Wake lock released by rollback"
-fi
+# NOTE: do not release the takeover wake lock here. It must stay held until
+# One UI is actually running again (see the end of this script); releasing it
+# while the display/services are still down lets the device suspend and the
+# Samsung softdog hrtimer miss its 100 s deadline.
 
 # Stop the guard from starting a second rollback while this one runs.
 mkdir -p "$STAGE" 2>/dev/null || true
@@ -96,7 +92,7 @@ if [ -f "$STAGE/media_suppress.pid" ]; then
     kill -9 "$(cat "$STAGE/media_suppress.pid")" 2>/dev/null || true
     rm -f "$STAGE/media_suppress.pid"
 fi
-for pat in onelineage_media_suppress adb_watchdog.sh ims_watchdog.sh ui_activator "ctl.stop zygote"; do
+for pat in onelineage_media_suppress adb_watchdog.sh ims_watchdog.sh ui_activator "UI Activator" "ctl.stop zygote"; do
     $BB pkill -9 -f "$pat" 2>/dev/null || true
 done
 
@@ -149,9 +145,42 @@ else
 fi
 
 echo "=== [5/6] Starting One UI Display & Host Services ==="
-for svc in surfaceflinger zygote audioserver cameraserver; do
+# Start everything that does not need the watchdog first. zygote is started
+# last because the host system_server is the only process that can feed
+# /dev/watchdog1, and the softdog kicker is still holding it.
+for svc in surfaceflinger audioserver cameraserver; do
     setprop ctl.start "$svc" 2>/dev/null || true
 done
+
+# Stop the softdog kicker immediately before zygote. A watchdog device has
+# exactly one opener: the new system_server cannot open /dev/watchdog1 until
+# the kicker's busybox feeder closes it. Busybox watchdog disarms the timer
+# with the magic 'V' close on TERM, so the handover window is safe.
+if [ -f "$STAGE/softdog_kicker.pid" ]; then
+    KPID=$($BB cat "$STAGE/softdog_kicker.pid" 2>/dev/null)
+    if [ -n "$KPID" ]; then
+        echo "Stopping softdog kicker (pid $KPID) before host zygote"
+        : > "$STAGE/stop_softdog_kicker"
+        kill -TERM "$KPID" 2>/dev/null || true
+        k=0
+        while kill -0 "$KPID" 2>/dev/null && [ "$k" -lt 20 ]; do
+            k=$((k + 1))
+            $BB sleep 0.2
+        done
+        kill -9 "$KPID" 2>/dev/null || true
+    fi
+    rm -f "$STAGE/softdog_kicker.pid"
+fi
+# The kicker may run the feeder in its own process group (setsid); sweep any
+# busybox watchdog still attached to the virtual softdog.
+for p in $($BB pidof watchdog 2>/dev/null); do
+    cmd=$($BB cat "/proc/$p/cmdline" 2>/dev/null | $BB tr '\0' ' ')
+    case "$cmd" in
+        *watchdog1*) kill -TERM "$p" 2>/dev/null || true ;;
+    esac
+done
+
+setprop ctl.start zygote 2>/dev/null || true
 # Start the swcodec component store before mediaserver so media.player can
 # answer the codec-list query immediately. vendor.media.omx normally stayed
 # running, but restarting a running init service is a no-op.
@@ -198,3 +227,11 @@ fi
 setenforce 1 2>/dev/null || true
 echo "SELinux mode: $(getenforce 2>/dev/null || echo unknown)"
 echo "One UI restored successfully."
+
+# Now that One UI owns the display and its PowerManager wakelocks again, the
+# headless window is over. Release the takeover wake lock last so the device
+# could not suspend while the guest was being torn down.
+if [ -w /sys/power/wake_unlock ]; then
+    echo "onelineage_takeover" > /sys/power/wake_unlock 2>/dev/null && \
+        echo "Wake lock released (One UI is up)"
+fi

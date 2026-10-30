@@ -76,23 +76,48 @@ echo "SELinux mode: $(getenforce 2>/dev/null || echo unknown)"
 # kernel panics ("Software Watchdog Timer expired 100s"). Hold a kernel
 # wakelock via /sys/power/wake_lock for the entire headless window.
 if [ -w /sys/power/wake_lock ]; then
-    echo "onelineage_takeover" > /sys/power/wake_lock 2>/dev/null && \
-        echo "Wake lock acquired: onelineage_takeover"
+    if ! $BB grep -q onelineage_takeover /sys/power/wake_lock 2>/dev/null; then
+        echo "onelineage_takeover" > /sys/power/wake_lock 2>/dev/null && \
+            echo "Wake lock acquired: onelineage_takeover"
+    else
+        echo "Wake lock already held: onelineage_takeover"
+    fi
 else
     echo "WARNING: /sys/power/wake_lock not writable; suspend may occur"
 fi
 
-# Release the wake lock on exit (rollback, success, or error).
-release_wakelock() {
-    if [ -w /sys/power/wake_unlock ]; then
-        echo "onelineage_takeover" > /sys/power/wake_unlock 2>/dev/null && \
-            echo "Wake lock released"
-    fi
-}
-trap release_wakelock EXIT INT TERM
+# IMPORTANT: do NOT release this lock when this orchestrator exits. It exits
+# as soon as the takeover daemon is launched, but the device stays headless
+# (no One UI PowerManager) until the guest framework is up. Releasing here let
+# the device suspend mid-boot, the softdog hrtimer stopped, and the kernel
+# panicked 100 s later (2026-10-29). The lock is released by
+# return_to_oneui.sh only after One UI is confirmed running again.
 
 # Keep the host's watchdog path schedulable before the guest starts.
 protect_host_cpu
+
+# --- SOFTDOG FEEDER -------------------------------------------------------
+# The HOST system_server is the only process that pings Samsung's software
+# watchdog (/dev/watchdog1, soft_margin=100 soft_panic=1). We are about to kill
+# it, and the guest's GSI system_server has no Samsung softdog feeder, so the
+# timer would expire exactly 100 s later:
+#   Kernel panic - not syncing: Software Watchdog Timer expired 100s
+# Start the feeder BEFORE One UI is stopped so it can capture system_server's
+# watchdog fd; it waits for system_server to exit and then feeds the device for
+# the whole guest session. return_to_oneui.sh stops it before restarting the
+# host zygote so the new system_server can open the device.
+rm -f "$STAGE/stop_softdog_kicker" "$STAGE/softdog_kicker.pid"
+if [ -f "$STAGE/softdog_kicker.sh" ]; then
+    chmod 755 "$STAGE/softdog_kicker.sh" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /system/bin/sh "$STAGE/softdog_kicker.sh" </dev/null >/dev/null 2>&1 &
+    else
+        nohup /system/bin/sh "$STAGE/softdog_kicker.sh" </dev/null >/dev/null 2>&1 &
+    fi
+    echo "Softdog kicker started (pid $!)"
+else
+    echo "WARNING: softdog_kicker.sh missing; the kernel softdog may panic 100s after system_server dies"
+fi
 
 # --- IMS / SMS REGISTRATION GATE -----------------------------------------
 # The guest has no ImsService of its own, so the modem's IMS registration is
@@ -290,6 +315,7 @@ echo "=== [5/6] Stopping One UI and handing over media/wifi ==="
 # loops' own command lines, so running them later would kill the suppression
 # that keeps Samsung init from resurrecting the host media stack mid-boot.
 pkill -9 -f "guest_guard.sh" 2>/dev/null || true
+pkill -9 -f "UI Activator" 2>/dev/null || true
 pkill -9 -f "onelineage_media_suppress" 2>/dev/null || true
 pkill -9 -f "ctl.stop zygote" 2>/dev/null || true
 rm -f "$STAGE/ui_ready" "$STAGE/guard_triggered" "$STAGE/stop_guard" "$STAGE/media_suppress.pid"
@@ -297,13 +323,15 @@ pkill -f "while true; do [ \"\$(getprop init.svc.zygote)\"" 2>/dev/null || true
 pkill -f "while true; do for p in \\\$(pidof audioserver cameraserver)" 2>/dev/null || true
 setprop ctl.stop zygote
 setprop ctl.stop surfaceflinger
-# audioserver/cameraserver are deliberately left running. The guest shares this
-# binder namespace, and its AudioService.<init> -> AudioDeviceBroker.init ->
+# cameraserver is deliberately left running. The guest shares this binder
+# namespace, and its AudioService.<init> -> AudioDeviceBroker.init ->
 # AudioSystem::addAudioPortCallback waits on media.audiopolicy with no timeout:
 # with no audio policy service registered, system_server's main thread hangs
-# (~2 min watchdog stall, boot stuck on the animation). Freezing them with
-# kill -STOP is the worst of both worlds - the binder registration survives
-# while the process can never answer.
+# (~2 min watchdog stall, boot stuck on the animation). The host audioserver is
+# therefore stopped only in the media handover below, and master_inner.sh starts
+# the GSI's audioserver before zygote so media.audiopolicy is registered again.
+# Freezing a server with kill -STOP is the worst of both worlds - the binder
+# registration survives while the process can never answer.
 kill -9 $(pidof surfaceflinger) 2>/dev/null || true
 kill -9 $(pidof bootanimation) 2>/dev/null || true
 kill -9 $(pidof app_process64) 2>/dev/null || true
@@ -330,15 +358,16 @@ sleep 1
 # them through stable AIDL/HIDL for hardware codecs.
 #
 # master_inner.sh starts the GSI's own mediaextractor/mediametrics/mediaswcodec/
-# mediaserver64 after pivot_root, so media.player/media.c2 belong to the guest
-# and MediaPlayer still has a working service.
-HOST_MEDIA_SVCS="media mediaextractor mediametrics media.swcodec"
+# mediaserver64/audioserver after pivot_root, so media.player/media.c2 and
+# media.audiopolicy belong to the guest and MediaPlayer/AudioService have
+# working services.
+HOST_MEDIA_SVCS="media mediaextractor mediametrics media.swcodec audioserver"
 for svc in $HOST_MEDIA_SVCS; do
     setprop ctl.stop "$svc" 2>/dev/null || true
 done
 # init names argv[0] after the service, so pidof needs media.metrics and
 # media.extractor rather than mediametrics/mediaextractor.
-for p in mediaserver media.metrics media.extractor media.swcodec; do
+for p in mediaserver media.metrics media.extractor media.swcodec audioserver; do
     kill -9 $(pidof "$p") 2>/dev/null || true
 done
 # Catch stragglers by cmdline too. Do NOT match media.codec: that is the vendor
@@ -347,6 +376,7 @@ pkill -9 -f "/system/bin/mediaserver" 2>/dev/null || true
 pkill -9 -f "/system/bin/mediaextractor" 2>/dev/null || true
 pkill -9 -f "/system/bin/mediametrics" 2>/dev/null || true
 pkill -9 -f "mediaswcodec" 2>/dev/null || true
+pkill -9 -f "/system/bin/audioserver" 2>/dev/null || true
 
 # Wait until the service names are actually gone. If a host mediaserver is still
 # registered, the guest's mediaserver cannot claim media.player and falls back
@@ -370,7 +400,7 @@ fi
 nohup $BB sh -c '
   # onelineage_media_suppress
   while true; do
-    for svc in media mediaextractor mediametrics media.swcodec; do
+    for svc in media mediaextractor mediametrics media.swcodec audioserver; do
       [ "$(getprop init.svc.$svc)" = "running" ] && setprop ctl.stop "$svc"
     done
     sleep 1
@@ -410,6 +440,9 @@ rm -f "$STAGE/guest_mnt_ns" "$STAGE/guest_root_src"
 PREP_RET=$?
 if [ $PREP_RET -ne 0 ]; then
     echo "ERROR: master_prepare.sh failed (code $PREP_RET)!"
+    # One UI is already stopped at this point, and the softdog feeder is holding
+    # the kernel watchdog. Roll back instead of exiting headless.
+    /system/bin/sh "$STAGE/return_to_oneui.sh" >> "$STAGE/guest_guard.log" 2>&1
     exit 1
 fi
 
@@ -448,17 +481,40 @@ $BB sh -c "
 BB=\"$BB\"
 [ -n \"\$BB\" ] || BB=\$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
 i=0
+DONE=
 while [ \$i -lt 100 ]; do
     i=\$((i + 1))
     sleep 2
     [ -f \"\$STAGE/guard_triggered\" ] && { echo '[UI Activator] Guard triggered; exiting.'; break; }
     PID=\$(pidof system_server | awk '{print \$1}')
     if [ -n \"\$PID\" ]; then
-        if $BB nsenter -t \$PID -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'; then
-            echo '[UI Activator] WindowManager is ready! Dismissing bootanim and unlocking...'
+        if $BB timeout -s KILL 10 $BB nsenter -t \$PID -m /system/bin/dumpsys window 2>/dev/null | grep -q 'mStatusBar'; then
+            DONE=1
+            echo '[UI Activator] WindowManager is ready; waiting for boot completion...'
             setprop service.bootanim.exit 1
             kill -9 \$(pidof bootanimation) 2>/dev/null
             sleep 1
+
+            # Do not unlock or start Home until the guest framework has finished
+            # booting. In the 19:52 run the activator fired as soon as
+            # WindowManager appeared, the launcher's TouchInteractionService
+            # started at 19:52:00 -- before BOOT_COMPLETED at 19:52:07 -- and
+            # OverviewComponentObserver crashed because
+            # resolveActivity(MAIN/HOME) returned null while PMS was settling.
+            b=0
+            BC=
+            while [ \$b -lt 90 ]; do
+                BC=\$($BB nsenter -t \$PID -m /system/bin/getprop sys.boot_completed 2>/dev/null)
+                [ \"\$BC\" = \"1\" ] && break
+                b=\$((b + 1))
+                sleep 2
+            done
+            echo \"[UI Activator] boot_completed=\$BC after \$((b * 2))s; settling\"
+            # The property may still read 1 from One UI (it is not reset when the
+            # host system_server is killed), so always give PMS/SystemUI a
+            # settle window before unlocking the user and binding the launcher.
+            sleep 15
+
             $BB nsenter -t \$PID -m /system/bin/svc power stayon true
             $BB nsenter -t \$PID -m /system/bin/settings put global stay_on_while_plugged_in 7
             $BB nsenter -t \$PID -m /system/bin/settings put system screen_off_timeout 2147483647
@@ -470,14 +526,41 @@ while [ \$i -lt 100 ]; do
             $BB nsenter -t \$PID -m /system/bin/cmd overlay enable-exclusive --category com.android.internal.systemui.navbar.gestural 2>/dev/null || true
             $BB nsenter -t \$PID -m /system/bin/settings put secure navigation_mode 2 2>/dev/null || true
             $BB nsenter -t \$PID -m /system/bin/pm disable android.ext.services/android.ext.services.notification.Assistant 2>/dev/null || true
+
+            # Realign app data dirs BEFORE the launcher starts. master_prepare
+            # pre-creates them as 1000:1000, but PMS expects the package uid
+            # (launcher3=10131); that mismatch made prepareAppData fail and the
+            # launcher crash on its first launch.
+            echo '[UI Activator] Realigning app data dirs...'
+            $BB nsenter -t \$PID -m /system/bin/sh /data/local/tmp/fix_app_dirs.sh 2>/dev/null || true
+            $BB nsenter -t \$PID -m /system/bin/sh /data/local/tmp/ensure_app_storage.sh 2>/dev/null || true
+
+            # The staged settings still name One UI's launcher, which does not
+            # exist in the guest. Point Home at the GSI launcher explicitly.
+            $BB nsenter -t \$PID -m /system/bin/cmd package set-home-activity --user 0 com.android.launcher3/com.android.launcher3.uioverrides.QuickstepLauncher 2>/dev/null || true
+
             $BB nsenter -t \$PID -m /system/bin/input keyevent 224
             $BB nsenter -t \$PID -m /system/bin/input keyevent 82
             $BB nsenter -t \$PID -m /system/bin/am unlock-user 0
+            sleep 3
             $BB nsenter -t \$PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME
-            echo '[UI Activator] Home activated!'
+
+            # The system may restart a launcher that crashed during unlock. Keep
+            # retrying Home until a launcher process survives two samples.
+            l=0
+            while [ \$l -lt 12 ]; do
+                if $BB nsenter -t \$PID -m /system/bin/pidof droid.launcher3 >/dev/null 2>&1; then
+                    sleep 3
+                    $BB nsenter -t \$PID -m /system/bin/pidof droid.launcher3 >/dev/null 2>&1 && break
+                fi
+                l=\$((l + 1))
+                echo \"[UI Activator] launcher not running; retry \$l/12\"
+                $BB nsenter -t \$PID -m /system/bin/am force-stop com.android.launcher3 2>/dev/null || true
+                sleep 5
+                $BB nsenter -t \$PID -m /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null || true
+            done
+            echo \"[UI Activator] Home activated (launcher retries=\$l)!\"
             echo ok > \"\$STAGE/ui_ready\"
-            echo '[UI Activator] Creating missing app data dirs...'
-            $BB nsenter -t \$PID -m /system/bin/sh /data/local/tmp/fix_app_dirs.sh 2>/dev/null || true
 
             # Install microG if requested
             if [ -f \"\$STAGE/install_microg.flag\" ]; then
@@ -511,7 +594,7 @@ while [ \$i -lt 100 ]; do
         fi
     fi
 done
-if [ \$i -ge 100 ]; then
+if [ -z \"\$DONE\" ]; then
     echo '[UI Activator] Timeout waiting for WindowManager; rolling back.'
     /system/bin/sh \"\$STAGE/return_to_oneui.sh\"
 fi
