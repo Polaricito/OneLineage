@@ -4,6 +4,22 @@ ROOTFS="$STAGE/rootfs"
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
 
+# Mounting system.raw requires the kernel loop thread to read the backing file.
+# Under Enforcing, the loop thread (u:r:kernel:s0) is denied read access to a
+# file labelled shell_data_file, so mount(2) fails with EIO and the rootfs stays
+# a collection of host binds with no GSI /system. switch_to_lineage.sh already
+# runs permissive for the takeover, but manual invocations and future callers
+# need the same guarantee here.
+PREV_ENFORCE=$(getenforce 2>/dev/null || echo Enforcing)
+if [ "$PREV_ENFORCE" != "Permissive" ]; then
+    setenforce 0 2>/dev/null || true
+fi
+
+restore_enforce() {
+    [ "$PREV_ENFORCE" = "Enforcing" ] && setenforce 1 2>/dev/null || true
+}
+trap restore_enforce EXIT INT TERM
+
 # Do NOT open /dev/watchdog here. Android's watchdogd owns the device; a second
 # opener gets EBUSY, and the old `ps | grep /dev/watchdog` check matched this
 # shell's own command line, so the "feeder" was a no-op. switch_to_lineage.sh
@@ -40,6 +56,23 @@ if ! mount | grep -q "$ROOTFS "; then
     $BB losetup "$LOOP" "$STAGE/system.raw"
     echo "Using LOOP: $LOOP"
     $BB mount -t ext4 -o ro "$LOOP" "$ROOTFS"
+    MOUNT_RC=$?
+    if [ $MOUNT_RC -ne 0 ] || [ ! -f "$ROOTFS/system/bin/sh" ]; then
+        echo "FATAL: system.raw mount failed (rc=$MOUNT_RC); rootfs would be a"
+        echo "host-bind frankenstein with no GSI /system. Aborting."
+        exit 1
+    fi
+fi
+
+# Remember the loop device backing system.raw. After pivot_root, every guest
+# process (including ones in private mount namespaces) keeps this as the source
+# of its "/" mount. /proc/<pid>/root reads as "/" for every process from the
+# host namespace, so return_to_oneui.sh uses this source plus the guest mount
+# namespace to find and kill the guest without touching host processes.
+ROOTFS_SRC=$($BB awk -v r="$ROOTFS" '$2 == r {print $1; exit}' /proc/mounts 2>/dev/null)
+if [ -n "$ROOTFS_SRC" ]; then
+    echo "$ROOTFS_SRC" > "$STAGE/guest_root_src"
+    echo "Guest root loop source: $ROOTFS_SRC"
 fi
 
 mkdir -p "$ROOTFS/postinstall" "$ROOTFS/dev" "$ROOTFS/proc" "$ROOTFS/sys" \
@@ -573,46 +606,106 @@ fi
 chmod 644 "$ROOTFS/apex/apex-info-list.xml" 2>/dev/null || true
 
 echo "=== 7. Direct Mounting Extracted APEX Payloads ==="
+# Payload extraction must read the GSI's own APEX files. A previous run leaves
+# the host's /system/apex bound here (re-bound at the end of this section), and
+# host /system/apex holds Samsung's media APEX. Expose system.raw's copy again
+# before extracting so a missing *_payload.img is never rebuilt from Samsung's
+# media/codec APEX.
+while mount | grep -q "$ROOTFS/system/apex "; do
+    $BB umount -l "$ROOTFS/system/apex" 2>/dev/null || break
+done
+if [ ! -f "$ROOTFS/system/apex/com.android.media.capex" ]; then
+    echo "WARNING: GSI /system/apex is not visible; cached payload images may be stale"
+fi
+
+# mount_payload NAME TARGET [SOURCE] [REQUIRED_FILE]
+#
+# SOURCE is optional; by default the GSI's preinstalled APEX is used:
+#   $ROOTFS/system/apex/com.android.NAME.capex (or .apex)
+# The GSI rootfs is exposed here because the host /system/apex bind is removed
+# above. REQUIRED_FILE is checked inside the mounted payload; a cached image
+# that lacks it (e.g. an old wifi_payload.img extracted from Samsung's APEX)
+# is rebuilt from SOURCE.
 mount_payload() {
     NAME="$1"
     TARGET="$2"
+    SRC_OVERRIDE="$3"
+    REQUIRED="$4"
     IMG="$STAGE/${NAME}_payload.img"
     DEST="$ROOTFS/apex/$TARGET"
-    if [ ! -f "$IMG" ]; then
-        CAPEX="$ROOTFS/system/apex/com.android.${NAME}.capex"
-        APEX="$ROOTFS/system/apex/com.android.${NAME}.apex"
-        if [ -f "$CAPEX" ]; then
-            $BB unzip -p "$CAPEX" original_apex > "$STAGE/temp_${NAME}.apex" 2>/dev/null
-            $BB unzip -p "$STAGE/temp_${NAME}.apex" apex_payload.img > "$IMG" 2>/dev/null
-            rm -f "$STAGE/temp_${NAME}.apex"
-        elif [ -f "$APEX" ]; then
-            $BB unzip -p "$APEX" apex_payload.img > "$IMG" 2>/dev/null
-        fi
+
+    if [ -n "$SRC_OVERRIDE" ]; then
+        SRC="$SRC_OVERRIDE"
+    else
+        SRC="$ROOTFS/system/apex/com.android.${NAME}.capex"
+        [ -f "$SRC" ] || SRC="$ROOTFS/system/apex/com.android.${NAME}.apex"
     fi
-    [ -f "$IMG" ] || return 0
-    if mount | grep "$DEST " | grep -q "/dev/block/dm-"; then
+
+    extract_payload() {
+        rm -f "$IMG"
+        case "$SRC" in
+            *.capex)
+                $BB unzip -p "$SRC" original_apex > "$STAGE/temp_${NAME}.apex" 2>/dev/null
+                $BB unzip -p "$STAGE/temp_${NAME}.apex" apex_payload.img > "$IMG" 2>/dev/null
+                rm -f "$STAGE/temp_${NAME}.apex"
+                ;;
+            *.apex)
+                $BB unzip -p "$SRC" apex_payload.img > "$IMG" 2>/dev/null
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+        [ -s "$IMG" ]
+    }
+
+    unmount_payload() {
         $BB umount -l "$DEST" 2>/dev/null || true
         for vdir in "$ROOTFS/apex/${TARGET}"@*; do
-       [ -d "$vdir" ] && $BB umount -l "$vdir" 2>/dev/null || true
+            [ -d "$vdir" ] && $BB umount -l "$vdir" 2>/dev/null || true
         done
+    }
+
+    mount_payload_image() {
+        LOOP=$($BB losetup -f)
+        $BB losetup "$LOOP" "$IMG" 2>/dev/null || return 1
+        if ! $BB mount -t ext4 -o ro "$LOOP" "$DEST" 2>/dev/null; then
+            $BB losetup -d "$LOOP" 2>/dev/null || true
+            return 1
+        fi
+        echo "Direct mounted $NAME on $LOOP -> $DEST"
+        for vdir in "$ROOTFS/apex/${TARGET}"@*; do
+            if [ -d "$vdir" ]; then
+                $BB mount -t ext4 -o ro "$LOOP" "$vdir" 2>/dev/null || true
+                echo "Direct mounted $NAME on $LOOP -> $vdir"
+            fi
+        done
+    }
+
+    if [ ! -s "$IMG" ]; then
+        extract_payload || true
     fi
-    if mount | grep "$DEST " | grep -q "/dev/block/loop"; then
-        echo "$NAME already mounted on loop at $DEST"
+    if [ ! -s "$IMG" ]; then
+        echo "WARNING: no GSI payload for $NAME ($SRC)"
         return 0
     fi
+
+    unmount_payload
     mkdir -p "$DEST"
-    $BB umount -l "$DEST" 2>/dev/null || true
-    LOOP=$($BB losetup -f)
-    $BB losetup "$LOOP" "$IMG"
-    $BB mount -t ext4 -o ro "$LOOP" "$DEST"
-    echo "Direct mounted $NAME on $LOOP -> $DEST"
-    for vdir in "$ROOTFS/apex/${TARGET}"@*; do
-        if [ -d "$vdir" ]; then
-       $BB umount -l "$vdir" 2>/dev/null || true
-       $BB mount -t ext4 -o ro "$LOOP" "$vdir"
-       echo "Direct mounted $NAME on $LOOP -> $vdir"
+    if ! mount_payload_image; then
+        echo "WARNING: failed to mount $NAME payload"
+        return 0
+    fi
+
+    if [ -n "$REQUIRED" ] && [ ! -e "$DEST/$REQUIRED" ]; then
+        echo "WARNING: $NAME payload is missing $REQUIRED; rebuilding from $SRC"
+        unmount_payload
+        if extract_payload && mount_payload_image; then
+            :
+        else
+            echo "WARNING: could not rebuild $NAME payload"
         fi
-    done
+    fi
 }
 
 mount_payload "art" "com.android.art"
@@ -625,7 +718,18 @@ mount_payload "crashrecovery" "com.android.crashrecovery"
 mount_payload "cellbroadcast" "com.android.cellbroadcast"
 mount_payload "extservices" "com.android.extservices"
 mount_payload "permission" "com.android.permission"
-mount_payload "wifi" "com.android.wifi"
+# The GSI zygote's BOOTCLASSPATH names framework-wifi.jar and
+# framework-telephony.jar; Samsung's host wifi APEX has neither, and the host
+# has no telephonycore APEX at all. Both must come from the GSI payloads or
+# ZygoteInit.preloadClasses() dies with:
+#   NoClassDefFoundError: Class not found using the boot class loader
+mount_payload "wifi" "com.android.wifi" "" "javalib/framework-wifi.jar"
+mount_payload "telephonycore" "com.android.telephonycore" "" "javalib/framework-telephony.jar"
+# compos is a regular APEX under the GSI's system/system_ext, not a .capex in
+# /system/apex. SYSTEMSERVERCLASSPATH needs its service-compos.jar.
+COMPOS_APEX="$ROOTFS/system/system_ext/apex/com.android.compos.apex"
+[ -f "$COMPOS_APEX" ] || COMPOS_APEX="$ROOTFS/system_ext/apex/com.android.compos.apex"
+mount_payload "compos" "com.android.compos" "$COMPOS_APEX" "javalib/service-compos.jar"
 mount_payload "appsearch" "com.android.appsearch"
 mount_payload "mediaprovider" "com.android.mediaprovider"
 mount_payload "adservices" "com.android.adservices"
@@ -634,6 +738,12 @@ mount_payload "healthfitness" "com.android.healthfitness"
 mount_payload "ondevicepersonalization" "com.android.ondevicepersonalization"
 mount_payload "configinfrastructure" "com.android.configinfrastructure"
 mount_payload "bt" "com.android.bt"
+# Media must come from the GSI, not the host. The guest's mediaserver64 links
+# against libmediaplayerservice/libmedia from this APEX; binding Samsung's APEX
+# would put Samsung's MediaCodecList back in the guest. media.swcodec provides
+# the GSI's software Codec2 components and its mediaswcodec service.
+mount_payload "media" "com.android.media"
+mount_payload "media.swcodec" "com.android.media.swcodec"
 
 # Payload extractions above used the GSI's own /system/apex files. Now that the
 # images are cached, present the HOST's /system/apex to the container so the
@@ -645,11 +755,25 @@ if [ -d /system/apex ]; then
 fi
 
 echo "=== 8. Bind-mounting Remaining Non-Payload APEXes ==="
+# com.android.media and com.android.media.swcodec MUST stay on the GSI payloads
+# mounted in section 7. Binding Samsung's host APEX versions would put Samsung's
+# MediaCodecList/parcel layout back into the guest and restart the codec-list
+# boot storm. The versioned host dirs (com.android.media@...) must not shadow
+# the payload mounts either.
 for a in /apex/*; do
     [ -d "$a" ] || continue
     base=$(basename "$a")
     case "$base" in
         *samsung*)
+       continue
+       ;;
+        com.android.media|com.android.media@*|com.android.media.swcodec|com.android.media.swcodec@*)
+       continue
+       ;;
+        com.android.wifi|com.android.wifi@*|com.android.telephonycore|com.android.telephonycore@*|com.android.compos|com.android.compos@*)
+       # These come from the GSI payloads above. Samsung's versions are
+       # missing the GSI's javalib jars (or are a different build), and binding
+       # them over the payload would put the missing classes back.
        continue
        ;;
     esac
@@ -658,6 +782,39 @@ for a in /apex/*; do
         mkdir -p "$ROOTFS/apex/$base"
         $BB mount --bind "$a" "$ROOTFS/apex/$base" 2>/dev/null || true
         echo "Bound $base -> $ROOTFS/apex/$base"
+    fi
+done
+
+# Sanity: the guest media stack must come from the GSI payloads. If these are
+# missing, section 7 failed and mediaserver64/MediaCodecList will misbehave
+# during the takeover; fail loudly here instead of during the boot storm.
+MEDIA_PAYLOAD_LIB="$ROOTFS/apex/com.android.media/lib64/libmediatranscoding.so"
+MEDIA_SWCODEC_BIN="$ROOTFS/apex/com.android.media.swcodec/bin/mediaswcodec"
+if [ ! -f "$MEDIA_PAYLOAD_LIB" ]; then
+    echo "!!! ERROR: $MEDIA_PAYLOAD_LIB missing; com.android.media payload did not mount"
+fi
+if [ ! -x "$MEDIA_SWCODEC_BIN" ]; then
+    echo "!!! ERROR: $MEDIA_SWCODEC_BIN missing; com.android.media.swcodec payload did not mount"
+fi
+
+# The guest zygote's BOOTCLASSPATH/SYSTEMSERVERCLASSPATH reference these jars.
+# A missing one makes app_process64 die during preloadClasses() with
+# "NoClassDefFoundError: Class not found using the boot class loader", before
+# system_server ever appears. Check them here so the prepare log names the
+# missing payload instead of leaving a bare zygote stderr line.
+for j in \
+    /apex/com.android.telephonycore/javalib/framework-telephony.jar \
+    /apex/com.android.wifi/javalib/framework-wifi.jar \
+    /apex/com.android.wifi/javalib/service-wifi.jar \
+    /apex/com.android.compos/javalib/service-compos.jar \
+    /apex/com.android.art/javalib/service-art.jar \
+    /apex/com.android.media/javalib/service-media-s.jar \
+    /apex/com.android.permission/javalib/service-permission.jar \
+    /apex/com.android.rkpd/javalib/service-rkp.jar; do
+    if [ -f "$ROOTFS$j" ]; then
+        echo "OK $j"
+    else
+        echo "!!! ERROR: $j missing; guest zygote/system_server may fail"
     fi
 done
 

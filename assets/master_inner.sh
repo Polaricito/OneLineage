@@ -1,6 +1,38 @@
 #!/system/bin/sh
+STAGE=/data/local/tmp/lineage_stage
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
+
+# Stage a guest-visible busybox before the pivot. $BB resolves to the host's
+# /data/adb/ksu/bin/busybox, which does not exist inside the guest /data; after
+# pivot_root every mount/setuidgid/sleep call would fail with ENOENT (that is
+# why the media stack used to fall back to root and /data_mirror stayed empty).
+if [ -x "$BB" ] && [ -d "$STAGE/data" ]; then
+    cp -f "$BB" "$STAGE/data/busybox" 2>/dev/null || true
+    chmod 755 "$STAGE/data/busybox" 2>/dev/null || true
+fi
+
+# pivot_root MUST run in a private mount namespace. If the caller forgot
+# `unshare -m`, this script would move the HOST's / into the container rootfs:
+# /system would then belong to the GSI, and return_to_oneui.sh would unmount
+# its own /system while rolling back. That is exactly what happened on
+# 2026-10-28 (the stale APK asset had no unshare call) and it ended in a
+# kernel panic. Refuse to continue unless we are isolated.
+MY_MNT_NS=$(readlink /proc/self/ns/mnt 2>/dev/null)
+HOST_MNT_NS=$(readlink /proc/1/ns/mnt 2>/dev/null)
+echo "[Pivoted Root] mount namespace: ${MY_MNT_NS:-unknown} (host: ${HOST_MNT_NS:-unknown})"
+if [ -z "$MY_MNT_NS" ] || [ "$MY_MNT_NS" = "$HOST_MNT_NS" ]; then
+    echo "[Pivoted Root] FATAL: running in the host mount namespace; refusing to pivot."
+    echo "[Pivoted Root] Start this script with: unshare -m sh master_inner.sh"
+    exit 1
+fi
+
+# Publish the guest mount namespace. After pivot_root, /proc/<pid>/root reads
+# as "/" for every process, so the guard and the rollback identify guest
+# processes by this namespace (plus the system.raw loop source recorded by
+# master_prepare.sh).
+echo "$MY_MNT_NS" > "$STAGE/guest_mnt_ns"
+echo "[Pivoted Root] Guest mount namespace: $MY_MNT_NS"
 
 # Keep the guest off CPU 0. switch_to_lineage.sh pins watchdogd/logd/adbd/imsd/
 # netd there, so a runaway guest process cannot starve the 100 s host watchdog.
@@ -14,7 +46,7 @@ if [ "$NCPU" -gt 1 ]; then
 fi
 
 echo "[Pivoted Root] Preparing pivot..."
-cd /data/local/tmp/lineage_stage/rootfs
+cd "$STAGE/rootfs"
 $BB mount --make-rprivate /
 if ! $BB pivot_root . postinstall; then
     echo "[Pivoted Root] Fallback: bind mounting rootfs onto itself..."
@@ -27,6 +59,15 @@ fi
 $BB mount -t proc proc /proc
 
 export PATH=/system/bin:/system/xbin
+
+# /data is the staged tree now, so use the guest-visible busybox copy staged
+# above. The host path /data/adb/ksu/bin/busybox is not part of the guest.
+if [ -x /data/busybox ]; then
+    BB=/data/busybox
+elif [ -x /system/bin/busybox ]; then
+    BB=/system/bin/busybox
+fi
+echo "[Pivoted Root] Post-pivot busybox: $BB"
 
 echo "[Pivoted Root] Setting up /data_mirror and /data/data mounts for Zygote isolation..."
 $BB mount --bind /data/user/0 /data/data 2>/dev/null || true
@@ -93,41 +134,68 @@ WIFICOND_PID=$!
 echo "[Pivoted Root] wificond PID: $WIFICOND_PID"
 sleep 1
 
-# Media. switch_to_lineage.sh stopped the whole host media stack so the guest
-# can own media.player/media.c2. Start the GSI's own media.codec and mediaserver:
-# MediaCodecList gets a compatible IMediaCodecList from the guest's
-# MediaPlayerService instead of parsing Samsung's parcel layout in a loop.
+# Media. switch_to_lineage.sh stopped Samsung's platform media services so the
+# guest can own media.player/media.c2. Start the GSI's own stack here:
+#   mediaserver64   -> media.player, media.resource_manager, media.resource_observer
+#   mediaextractor  -> media.extractor
+#   mediametrics    -> media.metrics
+#   mediaswcodec    -> android.hardware.media.c2.IComponentStore/software
+# MediaCodecList::getRemoteInstance() asks media.player for the codec list, so
+# media.player MUST be the guest's mediaserver64. If Samsung's mediaserver keeps
+# the name, the guest parses Samsung's IMediaCodecList parcel layout with its own
+# ABI in a loop until the CPU/watchdog dies. The vendor C2/OMX/DRM HALs are left
+# running: they speak stable AIDL/HIDL and give the guest hardware codecs.
 mkdir -p /data/misc/media /data/vendor/media
 chown 1013:1013 /data/misc/media /data/vendor/media 2>/dev/null || true
 chmod 0770 /data/misc/media /data/vendor/media 2>/dev/null || true
 
 start_guest_media() {
     b="$1"
-    [ -x "$b" ] || return 0
+    user="$2"
+    pname="$3"
+    if [ ! -x "$b" ]; then
+        echo "[Pivoted Root] MISSING media binary: $b"
+        return 0
+    fi
     name=$(basename "$b")
-    echo "[Pivoted Root] Starting $name..."
-    $BB setuidgid media "$b" > "/data/$name.log" 2>&1 &
+    echo "[Pivoted Root] Starting $pname ($b) as $user..."
+    $BB setuidgid "$user" "$b" > "/data/$name.log" 2>&1 &
     sleep 1
-    # Linux comm is limited to 15 characters, so pidof cannot match long names
-    # such as mediaresourcemanager directly. Check both forms.
-    short=$(echo "$name" | cut -c1-15)
     running=0
-    pidof "$name" >/dev/null 2>&1 && running=1
-    [ "$short" != "$name" ] && pidof "$short" >/dev/null 2>&1 && running=1
+    pidof "$pname" >/dev/null 2>&1 && running=1
     if [ "$running" -eq 0 ]; then
-        echo "[Pivoted Root] $name did not start as media; retrying as root"
-        "$b" > "/data/$name.log" 2>&1 &
+        echo "[Pivoted Root] $pname did not start as $user; retrying as root"
+        echo "setuidgid $user failed, retrying as root" >> "/data/$name.log"
+        "$b" >> "/data/$name.log" 2>&1 &
         sleep 1
+        if ! pidof "$pname" >/dev/null 2>&1; then
+            echo "[Pivoted Root] WARNING: $pname is not running; see /data/$name.log"
+        fi
     fi
 }
 
-# Metrics/extractor first, then Codec2 and the mediaserver that exposes
-# media.player. The binaries are named after their init services on AOSP.
-start_guest_media /system/bin/mediametrics
-start_guest_media /system/bin/mediaextractor
-start_guest_media /system/bin/media.codec
-start_guest_media /system/bin/mediaresourcemanager
-start_guest_media /system/bin/mediaserver
+# Match the GSI's own init users: media / mediaex / mediacodec. Start the
+# component store and the helpers before mediaserver64 so media.player can
+# resolve them as soon as the framework asks for a codec list.
+#
+# pidof matches the process name the binary sets, not its file name:
+#   mediaserver64  -> "mediaserver"
+#   mediaextractor -> "media.extractor"
+#   mediametrics   -> "media.metrics"
+#   mediaswcodec   -> "media.swcodec"
+start_guest_media /system/bin/mediametrics media media.metrics
+start_guest_media /system/bin/mediaextractor mediaex media.extractor
+start_guest_media /apex/com.android.media.swcodec/bin/mediaswcodec mediacodec media.swcodec
+start_guest_media /system/bin/mediaserver64 media mediaserver
+
+# media.player is the service the framework asks for its codec list. If it did
+# not come up, MediaCodecList falls back to a remote call on a dead/foreign
+# service and the boot storm starts. Make the failure loud in the log.
+if ! pidof mediaserver >/dev/null 2>&1; then
+    echo "[Pivoted Root] WARNING: mediaserver (mediaserver64) is not running; media.player is unavailable"
+    echo "[Pivoted Root] mediaserver64 log:"
+    tail -n 20 /data/mediaserver64.log 2>/dev/null
+fi
 
 # Overlay idmaps. idmap2 refuses the GSI's product overlays because framework-res
 # does not declare the targeted resources as overlayable, so OMS ends up with no
@@ -159,7 +227,56 @@ fi
 echo "[Pivoted Root] App storage sweeper started..."
 
 echo "[Pivoted Root] Cleaning stale sockets..."
+# /dev is the host's /dev (master_prepare.sh does not bind a private tmpfs), so
+# stopping the host zygote leaves /dev/socket/zygote and usap_pool_primary
+# behind. The guest zygote would then fail at bind() before it can open its own
+# log, leaving no clue why system_server never appeared.
+#
+# init can restart the host zygote while master_inner.sh is starting the media
+# stack, which recreates the sockets. Wait until the service is actually stopped
+# and kill any late zygote64 before removing them, so the guest's bind() cannot
+# race a fresh host socket.
+i=0
+while [ "$i" -lt 25 ]; do
+    [ "$(getprop init.svc.zygote 2>/dev/null)" = "stopped" ] && break
+    setprop ctl.stop zygote 2>/dev/null || true
+    for p in $(pidof zygote64 2>/dev/null); do
+        kill -9 "$p" 2>/dev/null || true
+    done
+    i=$((i + 1))
+    $BB sleep 0.2
+done
+echo "[Pivoted Root] Host zygote service: $(getprop init.svc.zygote 2>/dev/null || echo unknown)"
 rm -f /dev/socket/zygote /dev/socket/usap_pool_primary 2>/dev/null || true
 
 echo "[Pivoted Root] Launching LineageOS Zygote & SystemServer via zygote_exec..."
-exec /data/zygote_exec
+# zygote_exec redirects its own stdio to /data/zygote_stderr.log (patched from
+# /dev/null so an execve/linker failure is no longer silent). Create/truncate it
+# first: the binary opens it O_RDWR without O_CREAT.
+: > /data/zygote_stderr.log 2>/dev/null || true
+: > /data/zygote_early.log 2>/dev/null || true
+{
+    echo "== zygote preflight =="
+    ls -l /system/bin/app_process64 /system/bin/linker64 \
+        /apex/com.android.runtime/bin/linker64 \
+        /apex/com.android.art/lib64/libnativeloader.so \
+        /apex/com.android.art/lib64/libsigchain.so 2>&1
+    echo "== boot/systemserver classpath jars =="
+    for j in /apex/com.android.telephonycore/javalib/framework-telephony.jar \
+             /apex/com.android.wifi/javalib/framework-wifi.jar \
+             /apex/com.android.wifi/javalib/service-wifi.jar \
+             /apex/com.android.compos/javalib/service-compos.jar \
+             /apex/com.android.media/javalib/service-media-s.jar \
+             /system/framework/framework.jar \
+             /system/framework/services.jar; do
+        if [ -e "$j" ]; then
+            echo "OK $j $(wc -c < "$j" 2>/dev/null)"
+        else
+            echo "MISSING $j"
+        fi
+    done
+    echo "== linker --list =="
+    /system/bin/linker64 --list /system/bin/app_process64 2>&1
+    echo "linker_list_rc=$?"
+} >> /data/zygote_early.log 2>&1
+exec /system/bin/sh -c 'exec /data/zygote_exec >> /data/zygote_early.log 2>&1'

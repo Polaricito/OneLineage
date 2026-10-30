@@ -47,7 +47,7 @@ Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on
 10. **Networking.** The preferred APN is switched to `IPV4V6`, and `net_fix.sh` maintains a private routing table (4242) because the guest's ConnectivityService can't program the host's netd.
 11. **SMS.** `ims_watchdog.sh` keeps One UI's `imsd` running and `switch_to_lineage.sh` waits for voice registration before pivoting.
 12. **Boot diagnostics.** Each boot writes `/data/boot_failures.log`; the app's **Run diagnostics** button (or `preflight.sh` over adb) captures model, SELinux, watchdog, media-service, storage and dmesg state.
-13. **Media handover and watchdog safety.** The host's whole media stack (`media`, `media.codec`, `media.extractor`, `media.metrics`, `media.resource_manager`) is stopped, and the GSI's own `mediaserver`/`media.codec` are started inside the container. `MediaCodecList` gets a compatible `IMediaCodecList` from the guest instead of parsing Samsung's parcel layout in a loop. `watchdogd`, `logd`, `adbd`, `imsd` and `netd` are pinned to CPU 0, `watchdogd` gets RT priority, and the guest runs on CPUs 1..N-1. `guest_guard.sh` samples the log tail and `dmesg`, and rolls back to One UI before the ~100 s watchdog panic.
+13. **Media handover and watchdog safety.** The host's platform media services (`media`, `mediaextractor`, `mediametrics`, `media.swcodec`) are stopped, while vendor C2/OMX/DRM HALs keep running. Inside the container the GSI's own `mediaserver64`, `mediaextractor`, `mediametrics` and `mediaswcodec` start from the GSI media APEX payloads; Samsung's media APEXes are never bound. `MediaCodecList` therefore gets a compatible `IMediaCodecList` from the guest instead of parsing Samsung's parcel layout in a loop. `watchdogd`, `logd`, `adbd`, `imsd` and `netd` are pinned to CPU 0, `watchdogd` gets RT priority, and the guest runs on CPUs 1..N-1. `guest_guard.sh` samples the log tail and `dmesg` and rolls back to One UI before the ~100 s watchdog panic.
 
 ## Known issues
 - Returning to One UI may still need a manual reboot.
@@ -57,7 +57,7 @@ Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on
 - Never kill the host `netd` while Lineage is running.
 
 ## Building
-`build_apk.sh` auto-detects the Android SDK (`ANDROID_SDK_ROOT`/`ANDROID_HOME`, then the usual Windows/macOS/Linux locations), the newest installed build-tools and the android-34 platform. It creates a debug keystore on first use and writes `OneLineage-5.8.apk` in the project root.
+`build_apk.sh` auto-detects the Android SDK (`ANDROID_SDK_ROOT`/`ANDROID_HOME`, then the usual Windows/macOS/Linux locations), the newest installed build-tools and the android-34 platform. It creates a debug keystore on first use and writes `OneLineage-5.10.apk` in the project root.
 
 Requirements: JDK 17+ and Android SDK build-tools **36.0.0** (build-tools 34's `d8` crashes on the enum in `MainActivity` under JDK 21), plus platform 34. Install them with:
 
@@ -82,6 +82,21 @@ To collect diagnostics on a device:
 ```sh
 adb shell su -c 'sh /data/local/tmp/lineage_stage/preflight.sh'
 ```
+
+### Upgrading a device to a new build
+
+1. Bump `android:versionCode`/`android:versionName` in `AndroidManifest.xml`, `OUT_APK` in `build_apk.sh`, and the version in this README.
+2. Run `./build_apk.sh`.
+3. Install the new APK over the old one: `adb install -r OneLineage-5.10.apk`.
+4. Launch the app once. `extractAssets()` writes the new scripts into the app's `files/` directory and syncs them to `/data/local/tmp/lineage_stage`.
+5. Compare an asset hash with the staged copy:
+
+```sh
+adb shell su -c 'sha256sum /data/local/tmp/lineage_stage/switch_to_lineage.sh'
+adb shell su -c 'unzip -p $(pm path com.wewaffles.onelineage | sed s/package://) assets/switch_to_lineage.sh | sha256sum'
+```
+
+The sync is non-destructive: a staged script is replaced only when it is missing or older than the installed APK, so scripts pushed to `/data/local/tmp/lineage_stage` after the install (for testing) are kept.
 
 ## Credits
 LineageOS GSI builds by MisterZtr (SourceForge). LineageOS and Android are trademarks of their respective owners. Not affiliated with Samsung, Google or LineageOS.

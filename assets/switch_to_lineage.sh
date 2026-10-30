@@ -19,11 +19,15 @@ set_prop() {
 }
 
 # service(1) lives in /system/bin; keep a fallback for ROMs that only expose
-# the `cmd service` form.
+# the `cmd service` form. Wrap in timeout to avoid binder hangs when
+# system_server is down (the previous run hung indefinitely in
+# binder_wait_for_work, causing the prep window to exceed the softdog
+# deadline and panic the kernel).
 SVC="service"
 command -v service >/dev/null 2>&1 || SVC="/system/bin/service"
 service_list() {
-    $SVC list 2>/dev/null || cmd service list 2>/dev/null
+    # 5 s timeout is generous for a local servicemanager call.
+    timeout -s KILL 5 $SVC list 2>/dev/null || timeout -s KILL 5 cmd service list 2>/dev/null
 }
 
 # Reserve CPU 0 for the host's watchdog path and pin the guest to the rest.
@@ -64,6 +68,28 @@ echo "=== LINEAGEOS 23.2 TAKEOVER STARTING ==="
 # return_to_oneui.sh restores enforcing.
 setenforce 0 2>/dev/null || true
 echo "SELinux mode: $(getenforce 2>/dev/null || echo unknown)"
+
+# Prevent suspend during the takeover. When One UI (zygote/system_server/
+# surfaceflinger) is stopped, all Android wakelocks are released and the
+# device can enter suspend. The Samsung softdog watchdog uses a hrtimer that
+# does NOT run during suspend; if the hrtimer misses its 100 s deadline, the
+# kernel panics ("Software Watchdog Timer expired 100s"). Hold a kernel
+# wakelock via /sys/power/wake_lock for the entire headless window.
+if [ -w /sys/power/wake_lock ]; then
+    echo "onelineage_takeover" > /sys/power/wake_lock 2>/dev/null && \
+        echo "Wake lock acquired: onelineage_takeover"
+else
+    echo "WARNING: /sys/power/wake_lock not writable; suspend may occur"
+fi
+
+# Release the wake lock on exit (rollback, success, or error).
+release_wakelock() {
+    if [ -w /sys/power/wake_unlock ]; then
+        echo "onelineage_takeover" > /sys/power/wake_unlock 2>/dev/null && \
+            echo "Wake lock released"
+    fi
+}
+trap release_wakelock EXIT INT TERM
 
 # Keep the host's watchdog path schedulable before the guest starts.
 protect_host_cpu
@@ -220,25 +246,53 @@ if [ ! -f "$STAGE/system.raw" ]; then
     exit 1
 fi
 
-# Ensure all scripts and engine binaries exist in $STAGE
+# Ensure all scripts and engine binaries exist in $STAGE.
+#
+# The app re-extracts its APK assets into files/ on every launch, so a blind
+# `cp -f` here would overwrite scripts pushed to the stage for testing. That is
+# how the pre-unshare takeover script survived a reboot, pivoted the host root
+# and made the rollback unmount its own /system. Replace a staged file only
+# when it is missing or older than the installed APK; a file pushed after the
+# install is newer and wins.
 mkdir -p "$STAGE/data"
 APP_FILES="/data/user/0/com.wewaffles.onelineage/files"
+APP_PKG="com.wewaffles.onelineage"
+APK_PATH=$(pm path "$APP_PKG" 2>/dev/null | sed -n 's/^package://p' | head -n 1)
+APK_MTIME=0
+if [ -n "$APK_PATH" ]; then
+    APK_MTIME=$(stat -c %Y "$APK_PATH" 2>/dev/null || $BB stat -c %Y "$APK_PATH" 2>/dev/null || echo 0)
+fi
 if [ -d "$APP_FILES" ]; then
-    cp -f "$APP_FILES"/* "$STAGE/" 2>/dev/null || true
+    for f in "$APP_FILES"/*; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
+        dst="$STAGE/$base"
+        dst_mtime=0
+        [ -e "$dst" ] && dst_mtime=$(stat -c %Y "$dst" 2>/dev/null || $BB stat -c %Y "$dst" 2>/dev/null || echo 0)
+        if [ ! -e "$dst" ] || [ "$dst_mtime" -lt "$APK_MTIME" ]; then
+            cp -f "$f" "$dst" 2>/dev/null || true
+        fi
+    done
 fi
 chmod 755 "$STAGE"/*.sh "$STAGE/zygote_exec" 2>/dev/null || true
-
-# --- MOUNT PREPARATION ---
-echo "=== [5/6] Executing Mount Hierarchy Preparation ==="
-/system/bin/sh "$STAGE/master_prepare.sh"
-PREP_RET=$?
-if [ $PREP_RET -ne 0 ]; then
-    echo "ERROR: master_prepare.sh failed (code $PREP_RET)!"
-    exit 1
-fi
+echo "Staged assets: $(ls -l "$STAGE/switch_to_lineage.sh" "$STAGE/master_inner.sh" 2>/dev/null | $BB awk '{print $6, $7, $8, $9}')"
 
 # --- STOP HOST DAEMONS & LAUNCH CONTAINER ---
-echo "=== [6/6] Launching LineageOS Takeover Daemon ==="
+echo "=== [5/6] Stopping One UI and handing over media/wifi ==="
+# This must happen BEFORE master_prepare.sh. Prep bind-mounts the staged
+# /data/{app,user,...} trees over the host's real ones so the host's installd
+# and artd write into the guest. If One UI is still running while those bridges
+# are active, its zygote/system_server crash-loop on the guest data and the
+# host watchdog can panic before the guard is even started. The IMS gate above
+# already ran while One UI was alive, so stopping it now is safe.
+# Kill leftovers from a previous session and clear per-session health flags
+# BEFORE starting the new suppress loops. These pkill patterns match the new
+# loops' own command lines, so running them later would kill the suppression
+# that keeps Samsung init from resurrecting the host media stack mid-boot.
+pkill -9 -f "guest_guard.sh" 2>/dev/null || true
+pkill -9 -f "onelineage_media_suppress" 2>/dev/null || true
+pkill -9 -f "ctl.stop zygote" 2>/dev/null || true
+rm -f "$STAGE/ui_ready" "$STAGE/guard_triggered" "$STAGE/stop_guard" "$STAGE/media_suppress.pid"
 pkill -f "while true; do [ \"\$(getprop init.svc.zygote)\"" 2>/dev/null || true
 pkill -f "while true; do for p in \\\$(pidof audioserver cameraserver)" 2>/dev/null || true
 setprop ctl.stop zygote
@@ -265,39 +319,58 @@ sleep 1
 # returns MediaCodecList::getLocalInstance() from the HOST. Keeping mediaserver
 # alive therefore keeps Samsung's incompatible IMediaCodecList alive, and the
 # guest parses it with its own parcel layout until the CPU/watchdog dies.
-# Stop the whole host media stack; master_inner.sh starts the GSI's own
-# media.codec + mediaserver after pivot_root, so media.player/media.c2 are
-# compatible with the guest and MediaPlayer still has a working service.
-for svc in media media.codec media.extractor media.metrics media.resource_manager; do
+#
+# Samsung's init services are named after the process, not the binder service:
+#   media          -> /system/bin/mediaserver      -> media.player/resource_*
+#   mediaextractor -> /system/bin/mediaextractor   -> media.extractor
+#   mediametrics   -> /system/bin/mediametrics     -> media.metrics
+#   media.swcodec  -> .../bin/mediaswcodec         -> media.c2 (software)
+# `media.codec` is the vendor OMX HAL (init service vendor.media.omx), not a
+# platform service. Leave it and the vendor C2/DRM HALs running: the guest uses
+# them through stable AIDL/HIDL for hardware codecs.
+#
+# master_inner.sh starts the GSI's own mediaextractor/mediametrics/mediaswcodec/
+# mediaserver64 after pivot_root, so media.player/media.c2 belong to the guest
+# and MediaPlayer still has a working service.
+HOST_MEDIA_SVCS="media mediaextractor mediametrics media.swcodec"
+for svc in $HOST_MEDIA_SVCS; do
     setprop ctl.stop "$svc" 2>/dev/null || true
 done
-for p in media mediaserver media.codec mediaextractor mediametrics mediaresourcemanager; do
+# init names argv[0] after the service, so pidof needs media.metrics and
+# media.extractor rather than mediametrics/mediaextractor.
+for p in mediaserver media.metrics media.extractor media.swcodec; do
     kill -9 $(pidof "$p") 2>/dev/null || true
 done
-# pidof truncates comm to 15 chars; match the long resource-manager name too.
-pkill -9 -f "/system/bin/mediaresourcemanager" 2>/dev/null || true
+# Catch stragglers by cmdline too. Do NOT match media.codec: that is the vendor
+# OMX HAL, which the guest still needs.
+pkill -9 -f "/system/bin/mediaserver" 2>/dev/null || true
+pkill -9 -f "/system/bin/mediaextractor" 2>/dev/null || true
+pkill -9 -f "/system/bin/mediametrics" 2>/dev/null || true
+pkill -9 -f "mediaswcodec" 2>/dev/null || true
 
 # Wait until the service names are actually gone. If a host mediaserver is still
 # registered, the guest's mediaserver cannot claim media.player and falls back
-# to the incompatible host list again.
+# to the incompatible host list again. media.c2 is registered as the AIDL
+# interface name with the "software" instance, not as "media.c2".
+MEDIA_SVC_RE='media\.(player|extractor|metrics|resource_manager|resource_observer)|android\.hardware\.media\.c2\.IComponentStore/software'
 i=0
 while [ $i -lt 50 ]; do
-    service_list | grep -qE 'media\.(player|codec|c2|extractor|metrics|resource_manager)' || break
+    service_list | grep -qE "$MEDIA_SVC_RE" || break
     i=$((i+1))
     sleep 0.1
 done
-if service_list | grep -qE 'media\.(player|codec|c2|extractor|metrics|resource_manager)'; then
+if service_list | grep -qE "$MEDIA_SVC_RE"; then
     echo "WARNING: host media services still registered after stop:"
-    service_list | grep -E 'media\.(player|codec|c2|extractor|metrics|resource_manager)' || true
+    service_list | grep -E "$MEDIA_SVC_RE" || true
 fi
 
 # Keep Samsung init from resurrecting the host media stack while Lineage owns
-# the service names. The guest's mediaserver is not an init service, so this
+# the service names. The guest's media processes are not init services, so this
 # loop only affects the host.
 nohup $BB sh -c '
   # onelineage_media_suppress
   while true; do
-    for svc in media media.codec media.extractor media.metrics media.resource_manager; do
+    for svc in media mediaextractor mediametrics media.swcodec; do
       [ "$(getprop init.svc.$svc)" = "running" ] && setprop ctl.stop "$svc"
     done
     sleep 1
@@ -326,19 +399,23 @@ chmod 755 "$STAGE/data/master_inner.sh"
 cp -f "$STAGE/zygote_exec" "$STAGE/data/zygote_exec"
 chmod 755 "$STAGE/data/zygote_exec"
 
-# Launch takeover inside isolated mount namespace
-# Kill leftovers from a previous session, then clear per-session health flags.
-pkill -9 -f "guest_guard.sh" 2>/dev/null || true
-pkill -9 -f "onelineage_media_suppress" 2>/dev/null || true
-rm -f "$STAGE/ui_ready" "$STAGE/guard_triggered" "$STAGE/stop_guard" "$STAGE/media_suppress.pid"
+# --- MOUNT PREPARATION ---
+echo "=== [6/6] Executing Mount Hierarchy Preparation ==="
+# Drop markers from a previous session. master_prepare.sh rewrites
+# guest_root_src, and master_inner.sh rewrites guest_mnt_ns once it has entered
+# the private namespace. A stale namespace would make guest_guard.sh believe a
+# dead guest is healthy.
+rm -f "$STAGE/guest_mnt_ns" "$STAGE/guest_root_src"
+/system/bin/sh "$STAGE/master_prepare.sh"
+PREP_RET=$?
+if [ $PREP_RET -ne 0 ]; then
+    echo "ERROR: master_prepare.sh failed (code $PREP_RET)!"
+    exit 1
+fi
 
-$BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
-TAKEOVER_PID=$!
-echo "Takeover daemon PID: $TAKEOVER_PID"
-
-# Start the host-side guard. It watches the guest's log rate, dmesg watchdog
-# warnings and the UI-ready deadline, and rolls back to One UI before Samsung's
-# 100 s watchdog can panic the kernel.
+# Start the host-side guard BEFORE the guest. If the takeover ever runs in the
+# host mount namespace by mistake, the guard must already be alive in the real
+# host namespace so its rollback still sees /system.
 if [ -f "$STAGE/guest_guard.sh" ]; then
     chmod 755 "$STAGE/guest_guard.sh" 2>/dev/null || true
     if command -v setsid >/dev/null 2>&1; then
@@ -351,12 +428,27 @@ else
     echo "WARNING: guest_guard.sh missing; no automatic rollback on media storm."
 fi
 
+# Launch takeover inside an isolated mount namespace.
+$BB unshare -m $BB sh "$STAGE/data/master_inner.sh" </dev/null >"$STAGE/data/takeover.log" 2>&1 &
+TAKEOVER_PID=$!
+echo "Takeover daemon PID: $TAKEOVER_PID"
+$BB sleep 1
+TAKEOVER_NS=$(readlink "/proc/$TAKEOVER_PID/ns/mnt" 2>/dev/null)
+HOST_NS=$(readlink /proc/1/ns/mnt 2>/dev/null)
+echo "Takeover mount namespace: ${TAKEOVER_NS:-unknown} (host: ${HOST_NS:-unknown})"
+if [ -z "$TAKEOVER_NS" ] || [ "$TAKEOVER_NS" = "$HOST_NS" ]; then
+    echo "FATAL: takeover did not get a private mount namespace; aborting before pivot."
+    kill -9 "$TAKEOVER_PID" 2>/dev/null || true
+    /system/bin/sh "$STAGE/return_to_oneui.sh" >> "$STAGE/guest_guard.log" 2>&1
+    exit 1
+fi
+
 # Start UI Activator daemon
 $BB sh -c "
 BB=\"$BB\"
 [ -n \"\$BB\" ] || BB=\$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
 i=0
-while [ \$i -lt 45 ]; do
+while [ \$i -lt 100 ]; do
     i=\$((i + 1))
     sleep 2
     [ -f \"\$STAGE/guard_triggered\" ] && { echo '[UI Activator] Guard triggered; exiting.'; break; }
@@ -419,7 +511,7 @@ while [ \$i -lt 45 ]; do
         fi
     fi
 done
-if [ \$i -ge 45 ]; then
+if [ \$i -ge 100 ]; then
     echo '[UI Activator] Timeout waiting for WindowManager; rolling back.'
     /system/bin/sh \"\$STAGE/return_to_oneui.sh\"
 fi

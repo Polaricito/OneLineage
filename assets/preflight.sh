@@ -59,12 +59,16 @@ DMESG=/system/bin/dmesg
     fi
 
     echo
-    echo "-- media services --"
+    echo "-- media init services --"
+    for svc in media mediaextractor mediametrics media.swcodec mediadrm vendor.media.omx wificond; do
+        echo "$svc=$(getprop init.svc.$svc)"
+    done
+    echo "-- media binder services --"
     SVC=service
     command -v service >/dev/null 2>&1 || SVC=/system/bin/service
-    $SVC list 2>/dev/null | grep -E 'media\.(player|codec|c2|extractor|metrics|resource_manager|audio)' || echo "none"
+    $SVC list 2>/dev/null | grep -E 'media\.(player|extractor|metrics|resource_manager|resource_observer)|android\.hardware\.media\.c2\.IComponentStore|wifinl80211' || echo "none"
     echo "-- media processes --"
-    ps -A 2>/dev/null | grep -E 'media|watchdog|zygote|system_server' | grep -v grep || true
+    ps -A -o PID,PPID,USER,NAME,ARGS 2>/dev/null | grep -iE 'media|codec|omx' | grep -v grep || true
 
     echo
     echo "-- recent media logs --"

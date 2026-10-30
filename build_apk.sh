@@ -83,7 +83,7 @@ ZIPALIGN=$(find_tool zipalign) || die "zipalign not found in $BUILD_TOOLS"
 APKSIGNER=$(find_tool apksigner) || die "apksigner not found in $BUILD_TOOLS"
 
 BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build}"
-OUT_APK="${OUT_APK:-$PROJECT_DIR/OneLineage-5.8.apk}"
+OUT_APK="${OUT_APK:-$PROJECT_DIR/OneLineage-5.10.apk}"
 KEYSTORE="${KEYSTORE:-$PROJECT_DIR/keystore/debug.keystore}"
 
 echo "=== Build configuration ==="

@@ -7,12 +7,13 @@
 # and lives in the host mount namespace: it samples the log tail, looks for
 # watchdog warnings, and rolls back to One UI before the panic deadline.
 #
-# It is started by switch_to_lineage.sh after the takeover daemon is spawned.
+# It is started by switch_to_lineage.sh before the takeover daemon.
 STAGE="/data/local/tmp/lineage_stage"
 LOG="$STAGE/guest_guard.log"
 FLAG="$STAGE/guard_triggered"
 STOP="$STAGE/stop_guard"
 UI_READY="$STAGE/ui_ready"
+ROOTFS="$STAGE/rootfs"
 
 BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 [ -x "$BB" ] || BB=$(find /data/adb /system /data -name busybox 2>/dev/null | head -n 1)
@@ -23,35 +24,56 @@ DMESG=/system/bin/dmesg
 
 # Keep the guard itself on CPU 0 with the host watchdog path. It is mostly
 # sleeping, so this costs nothing and keeps its samples responsive under load.
-taskset -p 1 $$ 2>/dev/null || $BB taskset -p 1 $$ 2>/dev/null || true
+$BB taskset -p 1 $$ 2>/dev/null || taskset -p 1 $$ 2>/dev/null || true
 
 say() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
+    echo "$($BB date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
 }
 
 rollback() {
     [ -f "$FLAG" ] && exit 0
     say "ROLLBACK: $*"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" > "$FLAG"
+    echo "$($BB date '+%Y-%m-%d %H:%M:%S') $*" > "$FLAG"
     sync 2>/dev/null || true
+    # return_to_oneui.sh handles the final "host never came back" reboot.
     /system/bin/sh "$STAGE/return_to_oneui.sh" >> "$LOG" 2>&1
     exit 0
+}
+
+# A system_server is the guest's only if it runs in the guest mount namespace.
+# /proc/<pid>/root reads "/" for every process after pivot_root, so the old
+# root-link test never matched and the guard rolled back a healthy boot.
+# master_inner.sh writes the namespace to $STAGE/guest_mnt_ns; the loop source
+# written by master_prepare.sh catches children in private mount namespaces.
+guest_system_server() {
+    want=$($BB cat "$STAGE/guest_mnt_ns" 2>/dev/null)
+    src=$($BB cat "$STAGE/guest_root_src" 2>/dev/null)
+    for pid in $($BB pidof system_server 2>/dev/null); do
+        if [ -n "$want" ]; then
+            ns=$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)
+            [ "$ns" = "$want" ] && return 0
+        fi
+        if [ -n "$src" ] && $BB grep -q "^$src / " "/proc/$pid/mounts" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Keep watchdogd/logd/adbd/imsd/netd on CPU 0 and watchdogd at RT priority.
 # switch_to_lineage.sh does this once before the guest starts; init can restart
 # adbd/imsd later, so the guard re-applies it periodically.
 protect_host() {
-    NCPU=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+    NCPU=$($BB grep -c '^processor' /proc/cpuinfo 2>/dev/null)
     [ -n "$NCPU" ] || NCPU=1
     [ "$NCPU" -gt 1 ] || return 0
     for p in watchdogd logd adbd imsd netd; do
-        pid=$(pidof "$p" 2>/dev/null | awk '{print $1}')
+        pid=$($BB pidof "$p" 2>/dev/null | $BB awk '{print $1}')
         [ -n "$pid" ] || continue
-        taskset -p 1 "$pid" 2>/dev/null || $BB taskset -p 1 "$pid" 2>/dev/null || true
-        renice -n -20 "$pid" 2>/dev/null || $BB renice -n -20 "$pid" 2>/dev/null || true
+        $BB taskset -p 1 "$pid" 2>/dev/null || taskset -p 1 "$pid" 2>/dev/null || true
+        $BB renice -n -20 "$pid" 2>/dev/null || renice -n -20 "$pid" 2>/dev/null || true
         if [ "$p" = "watchdogd" ]; then
-            chrt -f -p 10 "$pid" 2>/dev/null || $BB chrt -f -p 10 "$pid" 2>/dev/null || true
+            $BB chrt -f -p 10 "$pid" 2>/dev/null || chrt -f -p 10 "$pid" 2>/dev/null || true
         fi
     done
 }
@@ -62,27 +84,40 @@ protect_host() {
 # (about 6 s) trigger the rollback.
 storm_count() {
     $LOGCAT -b all -d -t 2000 2>/dev/null | \
-        grep -cE 'MediaCodecList|codecHandlesFormat|AString: ctor got NULL'
+        $BB grep -cE 'MediaCodecList|codecHandlesFormat|AString: ctor got NULL'
 }
 
 say "guard started (pid $$)"
-START=$(date +%s)
+START=$($BB date +%s)
 protect_host
 BAD=0
 TICK=0
 
 while true; do
-    sleep 2
+    $BB sleep 2
     [ -f "$STOP" ] && { say "stop flag seen"; exit 0; }
     [ -f "$FLAG" ] && exit 0
+
+    # If the host root vanished, a takeover pivoted it without a private mount
+    # namespace. Recover from the host init's original root immediately.
+    if [ ! -x /system/bin/sh ]; then
+        say "host /system missing; recovering via /proc/1/root"
+        if [ -x /proc/1/root/system/bin/sh ]; then
+            $BB chroot /proc/1/root /system/bin/sh "$STAGE/return_to_oneui.sh" >> "$LOG" 2>&1
+        else
+            sync
+            echo b > /proc/sysrq-trigger 2>/dev/null || reboot -f 2>/dev/null || true
+        fi
+        exit 1
+    fi
 
     TICK=$((TICK + 1))
     if [ $((TICK % 5)) -eq 0 ]; then
         protect_host
     fi
 
-    if $DMESG 2>/dev/null | tail -n 200 | \
-        grep -qiE 'watchdog: BUG|watchdog timer expired|watchdog did not stop|softdog: .*failed|BUG: soft lockup'; then
+    if $DMESG 2>/dev/null | $BB tail -n 200 | \
+        $BB grep -qiE 'watchdog: BUG|watchdog timer expired|watchdog did not stop|softdog: .*failed|BUG: soft lockup'; then
         rollback "host watchdog/soft-lockup warning in dmesg"
     fi
 
@@ -97,12 +132,19 @@ while true; do
         rollback "media codec storm (${STORM}/2000 recent log lines, 3 samples)"
     fi
 
-    NOW=$(date +%s)
+    NOW=$($BB date +%s)
     ELAPSED=$((NOW - START))
-    if [ "$ELAPSED" -gt 75 ] && ! pidof system_server >/dev/null 2>&1; then
+    # A missing system_server means zygote never came up; waiting longer cannot
+    # help. A *slow* boot, however, is normal on this eMMC (load average ~15),
+    # and rolling back a healthy guest is worse than waiting: the storm check
+    # above is what protects the watchdog, and the guest is pinned off CPU 0.
+    if [ "$ELAPSED" -gt 75 ] && ! guest_system_server; then
         rollback "guest system_server is not running after ${ELAPSED}s"
     fi
-    if [ "$ELAPSED" -gt 85 ] && [ ! -f "$UI_READY" ]; then
+    # The UI activator waits up to 200 s (100 x 2 s) for WindowManager on this
+    # slow eMMC. Keep the guard deadline above it, or a healthy boot gets rolled
+    # back while the activator is still waiting.
+    if [ "$ELAPSED" -gt 240 ] && [ ! -f "$UI_READY" ]; then
         rollback "guest UI not ready after ${ELAPSED}s"
     fi
 

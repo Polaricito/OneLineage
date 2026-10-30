@@ -284,6 +284,33 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * Shell snippet that copies the app's extracted assets into the stage.
+     *
+     * A blind `cp -f` would overwrite scripts pushed to /data/local/tmp for
+     * testing with whatever the installed APK shipped, so a fix can silently
+     * be replaced by an older copy. Replace a staged file only when it is
+     * missing or older than the installed APK; files pushed after the install
+     * are newer and win.
+     */
+    private String stageSyncCommand(File filesDir) {
+        String files = filesDir.getAbsolutePath();
+        return "mkdir -p " + STAGE_DIR + " && " +
+               "APK=$(pm path com.wewaffles.onelineage 2>/dev/null | sed -n 's/^package://p' | head -n 1); " +
+               "APK_MTIME=0; " +
+               "[ -n \"$APK\" ] && APK_MTIME=$(stat -c %Y \"$APK\" 2>/dev/null || echo 0); " +
+               "for f in " + files + "/*; do " +
+               "  [ -f \"$f\" ] || continue; " +
+               "  base=${f##*/}; " +
+               "  dst=" + STAGE_DIR + "/$base; " +
+               "  dst_mtime=0; " +
+               "  [ -e \"$dst\" ] && dst_mtime=$(stat -c %Y \"$dst\" 2>/dev/null || echo 0); " +
+               "  if [ ! -e \"$dst\" ] || [ \"$dst_mtime\" -lt \"$APK_MTIME\" ]; then cp -f \"$f\" \"$dst\"; fi; " +
+               "done; " +
+               "cp -f " + files + "/7zz /data/local/tmp/7zz 2>/dev/null; " +
+               "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz /data/local/tmp/7zz 2>/dev/null";
+    }
+
     private void extractAssets() {
         executor.execute(() -> {
             String[] assets = {
@@ -316,14 +343,7 @@ public class MainActivity extends Activity {
             if (isRootGranted) {
                 try {
                     Runtime.getRuntime().exec(new String[]{
-                        suBinary, "-c",
-                        "mkdir -p " + STAGE_DIR + " && " +
-                        "for f in " + filesDir.getAbsolutePath() + "/*; do " +
-                        "  base=$(basename \"$f\"); " +
-                        "  cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; " +
-                        "done && " +
-                        "cp -f " + filesDir.getAbsolutePath() + "/7zz /data/local/tmp/7zz 2>/dev/null; " +
-                        "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz /data/local/tmp/7zz 2>/dev/null"
+                        suBinary, "-c", stageSyncCommand(filesDir)
                     }).waitFor();
                 } catch (Exception ignored) {}
             }
@@ -613,11 +633,7 @@ public class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 File filesDir = getFilesDir();
-                String syncCmd = "for f in " + filesDir.getAbsolutePath() + "/*; do " +
-                                 "  base=$(basename \"$f\"); " +
-                                 "  cp -f \"$f\" \"" + STAGE_DIR + "/$base\"; " +
-                                 "done && " +
-                                 "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz";
+                String syncCmd = stageSyncCommand(filesDir);
                 Runtime.getRuntime().exec(new String[]{suBinary, "-c", syncCmd}).waitFor();
 
                 String stageScript = STAGE_DIR + "/switch_to_lineage.sh";
@@ -679,9 +695,7 @@ public class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 File filesDir = getFilesDir();
-                String cmd = "mkdir -p " + STAGE_DIR + " && " +
-                             "cp -f \"" + filesDir.getAbsolutePath() + "/preflight.sh\" \"" + STAGE_DIR + "/preflight.sh\" && " +
-                             "chmod 755 \"" + STAGE_DIR + "/preflight.sh\" && " +
+                String cmd = stageSyncCommand(filesDir) + " && " +
                              "sh \"" + STAGE_DIR + "/preflight.sh\"";
                 Process p = new ProcessBuilder(suBinary, "-c", cmd)
                         .redirectErrorStream(true).start();
