@@ -9,9 +9,17 @@ Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on
 > It may not work on other Samsung models, other One UI versions, or other devices at all. It is experimental, it replaces core parts of a running system, and it can crash, hang or soft-brick your phone, fill `/data`, or break radio/SMS. **Back up everything first. Use at your own risk.**
 > Also, I did use AI a fair bit in this project, it would have taken a LOT longer without it.
 
+## Current state (5.19 / versionCode 24)
+- **Commit:** `dada0f3` on `https://github.com/Polaricito/OneLineage.git`
+- **APK:** `OneLineage-5.19.apk` (SHA-256 `3bdf30a8f0a983cc7e64ce789910fc9f15fe4828781082b3e6f72045fe447989`)
+- **Tested device:** SM-A536E (`a53xnsxx` / `a53x`), Android 16, One UI — not just the maintainer's S26 Ultra.
+- **Works:** guest zygote + system_server start, guest UI ready in ~140 s, SIM registers (LOADED / LTE IN_SERVICE / voice+SMS+DATA), Trebuchet launcher + systemui + phone run, audioserver + mediaserver64 + media.swcodec run, guest can take screenshots once storage is free, cold-boot rollback returns to One UI without a stuck boot screen, softdog feeder keeps `/dev/watchdog1` alive so the kernel doesn't panic, host biometric HALs restart on rollback, ADB TCP fallback on port 5555 during takeover.
+- **Fixed in 5.19:** zygote abort (`JNI FatalError: Not allowlisted (54): /data/zygote_stderr.log`) — `zygote_exec` stdio now goes to `/dev/null` and the wrapper keeps no `/data` fd open while zygote lives; rollback uses `reboot -f` instead of `setprop sys.powerctl reboot` (init's shutdown stalled on guest bridges and powered the phone off); `return_to_oneui.sh` writes `reboot_diag.log` before rebooting; stage sync only replaces files older than the installed APK; host zygote suppression is namespace-aware so the guest's own zygote isn't killed.
+- **Budgets:** 360 s system_server / 720 s UI-ready guard deadlines, 300-iteration (~600 s) UI Activator.
+
 ## Requirements
-- A rooted Samsung phone (the tested one is an S26 Ultra on One UI 8.5)
-- Enough free space on `/data` for the extracted GSI
+- A rooted Samsung phone (tested on SM-A536E and S26 Ultra)
+- Enough free space on `/data` for the extracted GSI (guest needs several GB free to launch apps, take screenshots, etc.)
 - Internet access for the GSI download (LineageOS 23.2 GSI, EXT4, VANILLA or GAPPS builds from SourceForge)
 
 ## What's in here
@@ -50,14 +58,24 @@ Hot-switch between stock **One UI** and a **LineageOS 23.2 (Android 16) GSI** on
 13. **Media handover and watchdog safety.** The host's platform media services (`media`, `mediaextractor`, `mediametrics`, `media.swcodec`) are stopped, while vendor C2/OMX/DRM HALs keep running. Inside the container the GSI's own `mediaserver64`, `mediaextractor`, `mediametrics` and `mediaswcodec` start from the GSI media APEX payloads; Samsung's media APEXes are never bound. `MediaCodecList` therefore gets a compatible `IMediaCodecList` from the guest instead of parsing Samsung's parcel layout in a loop. `watchdogd`, `logd`, `adbd`, `imsd` and `netd` are pinned to CPU 0, `watchdogd` gets RT priority, and the guest runs on CPUs 1..N-1. `guest_guard.sh` samples the log tail and `dmesg` and rolls back to One UI before the ~100 s watchdog panic.
 
 ## Known issues
-- Returning to One UI may still need a manual reboot.
-- No IMS stack in the guest, so **voice calls don't work** (data and SMS depend on One UI's `imsd`).
+- **Rollback:** Fixed in 5.19 — `return_to_oneui.sh` defaults to a cold reboot (`reboot -f`) so One UI comes back cleanly instead of a stuck boot screen. `ROLLBACK_REBOOT=0` keeps the old in-place restart for debugging.
+- **No IMS in the guest** — give up on this: no LineageOS ROM has IMS support (only One UI-based ROMs do). Voice calls don't work in the guest; data and SMS ride One UI's `imsd`. Don't spend more time here.
+- **WiFi:** shows "connected" but no internet in the guest. Needs investigation of the guest's netd/wificond vs the host's bridged interfaces (priority for next session).
+- **Storage:** the guest needs several GB free on `/data` to launch apps and take screenshots; free up ~5 GB or add a storage-cleanup step before takeover (priority for next session).
+- **Camera:** the camera app reports "camera in use" but doesn't actually work. Needs the guest's camera HAL vs the host's bridged camera service sorted out (priority for next session).
 - Developer options crash (the guest registers no `adb` service).
 - DTMF tones glitch, and deep-buffer audio hangs, so it stays disabled.
 - Never kill the host `netd` while Lineage is running.
 
+## Next steps (next session)
+1. Guest WiFi: connected but no internet — trace `netd`/`wificond` in the guest, check the private routing table (4242) and the APN switch to `IPV4V6`.
+2. Free ~5 GB on `/data` for the guest so apps launch and screenshots work; add a storage check/cleanup to `preflight.sh` or `master_prepare.sh`.
+3. Guest camera "in use" but non-functional — reconcile the guest camera HAL with the host camera service.
+4. Re-verify on SM-A536E after each fix: SIM registration, audio/media, launcher, cold-boot rollback, `reboot_diag.log`.
+5. Commit/push progress checkpoints so nothing is lost.
+
 ## Building
-`build_apk.sh` auto-detects the Android SDK (`ANDROID_SDK_ROOT`/`ANDROID_HOME`, then the usual Windows/macOS/Linux locations), the newest installed build-tools and the android-34 platform. It creates a debug keystore on first use and writes `OneLineage-5.10.apk` in the project root.
+`build_apk.sh` auto-detects the Android SDK (`ANDROID_SDK_ROOT`/`ANDROID_HOME`, then the usual Windows/macOS/Linux locations), the newest installed build-tools and the android-34 platform. It creates a debug keystore on first use and writes `OneLineage-5.19.apk` in the project root.
 
 Requirements: JDK 17+ and Android SDK build-tools **36.0.0** (build-tools 34's `d8` crashes on the enum in `MainActivity` under JDK 21), plus platform 34. Install them with:
 
@@ -87,8 +105,8 @@ adb shell su -c 'sh /data/local/tmp/lineage_stage/preflight.sh'
 
 1. Bump `android:versionCode`/`android:versionName` in `AndroidManifest.xml`, `OUT_APK` in `build_apk.sh`, and the version in this README.
 2. Run `./build_apk.sh`.
-3. Install the new APK over the old one: `adb install -r OneLineage-5.10.apk`.
-4. Launch the app once. `extractAssets()` writes the new scripts into the app's `files/` directory and syncs them to `/data/local/tmp/lineage_stage`.
+3. Install the new APK over the old one: `adb install -r OneLineage-5.19.apk`.
+4. Force-stop the app (`adb shell am force-stop com.wewaffles.onelineage`) so a running process can't sync stale cached assets, then launch the app once. `extractAssets()` writes the new scripts into the app's `files/` directory and syncs them to `/data/local/tmp/lineage_stage`.
 5. Compare an asset hash with the staged copy:
 
 ```sh
