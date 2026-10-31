@@ -483,8 +483,26 @@ setprop ctl.stop wificond 2>/dev/null || true
 kill -9 $(pidof wificond) 2>/dev/null || true
 sleep 1
 
-# Suppress the host zygote only, so Samsung init does not resurrect it
-nohup $BB sh -c "while true; do [ \"\$(getprop init.svc.zygote)\" = \"running\" ] && setprop ctl.stop zygote; sleep 1; done" </dev/null >/dev/null 2>&1 &
+# Suppress the host zygote only, so Samsung init does not resurrect it.
+# The old check watched the global init.svc.zygote property: when the guest
+# init started its own zygote, the property became "running" and this loop
+# sent ctl.stop zygote, killing the guest's zygote too (observed 2026-10-30:
+# surfaceflinger/media came up but no zygote/system_server ever appeared).
+# Compare the mount namespace instead and only stop host-namespace zygotes.
+HOST_NS=$(readlink /proc/self/ns/mnt 2>/dev/null)
+nohup $BB sh -c '
+  HOST_NS="$1"
+  while true; do
+    for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
+      ns=$(readlink /proc/$p/ns/mnt 2>/dev/null)
+      if [ -n "$ns" ] && [ "$ns" = "$HOST_NS" ]; then
+        setprop ctl.stop zygote
+        break
+      fi
+    done
+    sleep 1
+  done
+' sh "$HOST_NS" </dev/null >/dev/null 2>&1 &
 
 # Copy inner script and zygote_exec into container data partition
 cp -f "$STAGE/master_inner.sh" "$STAGE/data/master_inner.sh"

@@ -346,9 +346,12 @@ if [ -x /system/bin/logcat ]; then
     /system/bin/logcat -b all -v threadtime -r 4096 -n 2 -f /data/guest_logcat.log &
     echo "[Pivoted Root] guest logcat PID: $! (rotating 2x4MB)"
 fi
-# zygote_exec redirects its own stdio to /data/zygote_stderr.log (patched from
-# /dev/null so an execve/linker failure is no longer silent). Create/truncate it
-# first: the binary opens it O_RDWR without O_CREAT.
+# zygote_exec redirects its own stdio to /dev/null. Do NOT point it at a /data
+# file: ART's zygote fd allowlist rejects any inherited /data descriptor when it
+# forks system_server and aborts with
+#   JNI FatalError called: (system_server) Not allowlisted (54): /data/zygote_stderr.log
+# (tombstone_29, 2026-10-30). The old binary's stderr path was patched to
+# /dev/null; keep this truncate only so an older staged binary still has a file.
 : > /data/zygote_stderr.log 2>/dev/null || true
 : > /data/zygote_early.log 2>/dev/null || true
 {
@@ -375,4 +378,15 @@ fi
     /system/bin/linker64 --list /system/bin/app_process64 2>&1
     echo "linker_list_rc=$?"
 } >> /data/zygote_early.log 2>&1
-exec /system/bin/sh -c 'exec /data/zygote_exec >> /data/zygote_early.log 2>&1'
+# zygote_exec is a minimal static launcher that execs app_process64. If the
+# exec fails or app_process64 dies before system_server appears, the old code
+# left an empty zygote_stderr.log with no clue. Run it under a shell that
+# records the exit status: the shell stays as the takeover daemon while zygote
+# lives, and logs rc=N to zygote_early.log if zygote exits.
+#
+# The shell's own stdio must stay on /dev/null while zygote lives. A
+# `{ ...; } >> /data/zygote_early.log` redirection would keep a /data fd open
+# in the takeover daemon for the whole guest session; zygote_exec closes fds
+# 5..63 before exec, but keeping /data out of the process tree entirely is
+# cheaper than relying on that. Open the log only after zygote exits.
+exec /system/bin/sh -c '/data/zygote_exec; rc=$?; echo "zygote_exec exited rc=$rc" >> /data/zygote_early.log' </dev/null >/dev/null 2>&1

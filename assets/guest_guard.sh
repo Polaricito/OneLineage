@@ -203,10 +203,13 @@ while true; do
             echo "onelineage_takeover" > /sys/power/wake_lock 2>/dev/null || true
             say "re-acquired takeover wake lock"
         fi
+        ZY=$($BB pidof zygote64 2>/dev/null | $BB tr ' ' ',')
+        AP=$($BB pidof app_process64 2>/dev/null | $BB tr ' ' ',')
+        SS=$($BB pidof system_server 2>/dev/null | $BB tr ' ' ',')
         if [ -f "$UI_READY" ]; then
-            say "alive: ${ELAPSED}s, storm=${STORM}, ui=ready"
+            say "alive: ${ELAPSED}s, storm=${STORM}, ui=ready, zygote=${ZY:-none}, app_process=${AP:-none}, system_server=${SS:-none}"
         else
-            say "alive: ${ELAPSED}s, storm=${STORM}, ui=booting"
+            say "alive: ${ELAPSED}s, storm=${STORM}, ui=booting, zygote=${ZY:-none}, app_process=${AP:-none}, system_server=${SS:-none}"
         fi
     fi
 done

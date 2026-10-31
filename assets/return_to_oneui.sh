@@ -10,6 +10,14 @@ BB=$(which busybox 2>/dev/null || echo "/data/adb/ksu/bin/busybox")
 # One UI is actually running again (see the end of this script); releasing it
 # while the display/services are still down lets the device suspend and the
 # Samsung softdog hrtimer miss its 100 s deadline.
+#
+# ROLLBACK_REBOOT=1 (default) ends the rollback with a cold reboot instead of
+# restarting One UI in place. The in-place path leaves the host on a
+# half-initialised boot screen (display up, activity service missing, adb
+# alive) and needs a manual power cycle (observed 2026-10-30). All guest state
+# - bind mounts, loop devices, runtime properties and service overrides - is
+# per-boot, so after unmounting the bridges a cold boot is deterministic.
+# Set ROLLBACK_REBOOT=0 to keep the old in-place restart for debugging.
 
 # Stop the guard from starting a second rollback while this one runs.
 mkdir -p "$STAGE" 2>/dev/null || true
@@ -142,6 +150,61 @@ if $BB cat /proc/mounts 2>/dev/null | $BB grep -q " /storage/emulated "; then
 else
     echo "WARNING: host /storage/emulated is missing; asking init to start vold."
     setprop ctl.start vold 2>/dev/null || true
+fi
+
+# --- COLD-BOOT ROLLBACK ---
+# A guest session is identified by guest_mnt_ns (written by master_inner.sh).
+# When one exists, reboot instead of trying to resurrect One UI in place.
+if [ "${ROLLBACK_REBOOT:-1}" = "1" ] && [ -s "$STAGE/guest_mnt_ns" ]; then
+    echo "=== [5/6] Rebooting into One UI (cold boot) ==="
+    # Persist the evidence first: a reboot clears dmesg, and the last guest
+    # boot is exactly what we need when zygote/system_server never appeared.
+    {
+        echo "=== rollback reboot diagnostics $(date) ==="
+        echo "--- guest ns / root ---"
+        cat "$STAGE/guest_mnt_ns" "$STAGE/guest_root_src" 2>/dev/null
+        echo "--- ps ---"
+        ps -A -o PID,PPID,NAME,ARGS 2>/dev/null
+        echo "--- zygote_early tail ---"
+        tail -30 "$STAGE/data/zygote_early.log" 2>/dev/null
+        echo "--- zygote_stderr tail ---"
+        tail -60 "$STAGE/data/zygote_stderr.log" 2>/dev/null
+        echo "--- guest logcat tail ---"
+        tail -300 "$STAGE/data/guest_logcat.log" 2>/dev/null
+        echo "--- dmesg tail ---"
+        dmesg 2>/dev/null | tail -150
+    } > "$STAGE/reboot_diag.log" 2>&1
+    echo "Diagnostics saved to $STAGE/reboot_diag.log"
+
+    # Stop the softdog feeder before the reboot. Its busybox watchdog disarms
+    # the timer with the magic 'V' close on TERM.
+    : > "$STAGE/stop_softdog_kicker" 2>/dev/null || true
+    if [ -f "$STAGE/softdog_kicker.pid" ]; then
+        KPID=$($BB cat "$STAGE/softdog_kicker.pid" 2>/dev/null)
+        [ -n "$KPID" ] && kill -TERM "$KPID" 2>/dev/null || true
+        rm -f "$STAGE/softdog_kicker.pid"
+    fi
+    for p in $($BB pidof watchdog 2>/dev/null); do
+        cmd=$($BB cat "/proc/$p/cmdline" 2>/dev/null | $BB tr '\0' ' ')
+        case "$cmd" in
+            *watchdog1*) kill -TERM "$p" 2>/dev/null || true ;;
+        esac
+    done
+    if [ -w /sys/power/wake_unlock ]; then
+        echo "onelineage_takeover" > /sys/power/wake_unlock 2>/dev/null || true
+    fi
+    sync
+
+    # Do NOT use setprop sys.powerctl here. That asks host init to run its full
+    # shutdown, which can stall on the guest's bridged /data/loop devices and
+    # end in a power-off instead of a reboot (observed 2026-10-30: the phone
+    # stayed off with no USB device after the guard rollback). A kernel restart
+    # bypasses init entirely. All guest state is per-boot and the filesystems
+    # were synced above, so this is the deterministic path.
+    echo "Rebooting via kernel restart (bypassing init shutdown)"
+    reboot -f 2>/dev/null || echo b > /proc/sysrq-trigger 2>/dev/null || \
+        setprop sys.powerctl reboot 2>/dev/null || true
+    exit 0
 fi
 
 echo "=== [5/6] Starting One UI Display & Host Services ==="
