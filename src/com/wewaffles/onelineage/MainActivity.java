@@ -63,6 +63,18 @@ public class MainActivity extends Activity {
     private static final String STAGE_DIR = "/data/local/tmp/lineage_stage";
     private static final String SYSTEM_RAW = STAGE_DIR + "/system.raw";
 
+    // Small scripts that must always match the installed APK. The stage sync is
+    // mtime-based and copies the cached filesDir copies, so a stale cache (for
+    // example after installing a new APK without launching it) used to overwrite
+    // a freshly pushed fix with an older script. Refresh these from the APK
+    // before every takeover/rollback.
+    private static final String[] SCRIPT_ASSETS = {
+        "switch_to_lineage.sh", "return_to_oneui.sh",
+        "master_prepare.sh", "master_inner.sh",
+        "guest_guard.sh", "preflight.sh", "softdog_kicker.sh",
+        "zygote_exec"
+    };
+
     private static final String URL_VANILLA = "https://downloads.sourceforge.net/project/misterztr-gsi/LineageOS/Android%2016/LineageOS-23.2-20260524-VANILLA-EXT4-GSI.7z?use_mirror=autoselect";
     private static final String URL_GAPPS = "https://downloads.sourceforge.net/project/misterztr-gsi/LineageOS/Android%2016/LineageOS-23.2-20260524-GAPPS-EXT4-GSI.7z?use_mirror=autoselect";
     private static final long ESTIMATED_VANILLA_BYTES = 922022276L;
@@ -309,6 +321,32 @@ public class MainActivity extends Activity {
                "done; " +
                "cp -f " + files + "/7zz /data/local/tmp/7zz 2>/dev/null; " +
                "chmod 755 " + STAGE_DIR + "/*.sh " + STAGE_DIR + "/zygote_exec " + STAGE_DIR + "/7zz /data/local/tmp/7zz 2>/dev/null";
+    }
+
+    /**
+     * Re-extract the shell scripts from the installed APK into filesDir before
+     * a stage sync. extractAssets() normally does this, but it runs
+     * asynchronously and is skipped when the activity is already alive across an
+     * APK update. Without this, stageSyncCommand() can copy an old cached
+     * script over a newer one in the stage (observed 2026-10-30: a 150 s
+     * guest_guard.sh replaced the 300 s version at takeover time).
+     */
+    private void refreshScriptsFromApk(File filesDir) {
+        for (String asset : SCRIPT_ASSETS) {
+            File target = new File(filesDir, asset);
+            try (InputStream in = getAssets().open(asset);
+                 OutputStream out = new FileOutputStream(target)) {
+                byte[] buffer = new byte[32768];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                }
+                target.setExecutable(true, false);
+                target.setReadable(true, false);
+            } catch (Exception e) {
+                appendLog("Error refreshing " + asset + ": " + e.getMessage());
+            }
+        }
     }
 
     private void extractAssets() {
@@ -633,6 +671,7 @@ public class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 File filesDir = getFilesDir();
+                refreshScriptsFromApk(filesDir);
                 String syncCmd = stageSyncCommand(filesDir);
                 Runtime.getRuntime().exec(new String[]{suBinary, "-c", syncCmd}).waitFor();
 
@@ -665,6 +704,10 @@ public class MainActivity extends Activity {
         setLogStatus("Restoring…");
         executor.execute(() -> {
             try {
+                File filesDir = getFilesDir();
+                refreshScriptsFromApk(filesDir);
+                Runtime.getRuntime().exec(new String[]{suBinary, "-c",
+                        stageSyncCommand(filesDir)}).waitFor();
                 String stageScript = STAGE_DIR + "/return_to_oneui.sh";
                 String cmd = "stageScript=" + STAGE_DIR + "/return_to_oneui.sh; " +
                              "chmod 755 $stageScript; " +
@@ -695,6 +738,7 @@ public class MainActivity extends Activity {
         executor.execute(() -> {
             try {
                 File filesDir = getFilesDir();
+                refreshScriptsFromApk(filesDir);
                 String cmd = stageSyncCommand(filesDir) + " && " +
                              "sh \"" + STAGE_DIR + "/preflight.sh\"";
                 Process p = new ProcessBuilder(suBinary, "-c", cmd)

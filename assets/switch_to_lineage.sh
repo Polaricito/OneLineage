@@ -10,6 +10,20 @@ export BB
 export RP
 export STAGE
 
+# Refuse to run two orchestrators at once. A second run pkill's the active
+# guest_guard and tears down a healthy takeover halfway through (observed
+# 2026-10-30 when the app's Start button was tapped during an adb-launched run).
+SWITCH_LOCK="$STAGE/switch.lock"
+if [ -f "$SWITCH_LOCK" ]; then
+    OLD_PID=$(cat "$SWITCH_LOCK" 2>/dev/null)
+    if [ -n "$OLD_PID" ] && [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "ERROR: switch_to_lineage.sh already running (pid $OLD_PID); refusing second takeover"
+        exit 1
+    fi
+fi
+echo $$ > "$SWITCH_LOCK"
+trap 'rm -f "$SWITCH_LOCK"' EXIT INT TERM
+
 set_prop() {
     if [ -n "$RP" ] && [ -x "$RP" ]; then
         "$RP" "$1" "$2" 2>/dev/null || true
@@ -531,7 +545,7 @@ BB=\"$BB\"
 [ -n \"\$BB\" ] || BB=\$(which busybox 2>/dev/null || echo /data/adb/ksu/bin/busybox)
 i=0
 DONE=
-while [ \$i -lt 100 ]; do
+while [ \$i -lt 300 ]; do
     i=\$((i + 1))
     sleep 2
     [ -f \"\$STAGE/guard_triggered\" ] && { echo '[UI Activator] Guard triggered; exiting.'; break; }

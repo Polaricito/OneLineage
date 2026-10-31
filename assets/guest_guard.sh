@@ -172,16 +172,17 @@ while true; do
     # and rolling back a healthy guest is worse than waiting: the storm check
     # above is what protects the watchdog, and the guest is pinned off CPU 0.
     # The previous successful run needed between 150s and 233s for system_server
-    # to appear; 300s gives ample margin without risking the softdog (the kicker
+    # to appear; 360s gives ample margin without risking the softdog (the kicker
     # feeds independently every 10s).
-    if [ "$ELAPSED" -gt 300 ] && ! guest_system_server; then
+    if [ "$ELAPSED" -gt 360 ] && ! guest_system_server; then
         rollback "guest system_server is not running after ${ELAPSED}s"
     fi
-    # The UI activator waits up to 200 s for WindowManager, then up to 180 s
-    # for boot completion, a 15 s settle, and up to 96 s of launcher retries on
-    # this slow eMMC. The softdog kicker keeps the kernel alive independently,
-    # so a long boot is safe; only roll back after the activator's full budget.
-    if [ "$ELAPSED" -gt 480 ] && [ ! -f "$UI_READY" ]; then
+    # The UI activator waits up to ~600 s for WindowManager (300 iterations),
+    # then up to 180 s for boot completion, a 15 s settle, and up to 96 s of
+    # launcher retries on this slow eMMC. The softdog kicker keeps the kernel
+    # alive independently, so a long boot is safe; only roll back after the
+    # activator's full budget.
+    if [ "$ELAPSED" -gt 720 ] && [ ! -f "$UI_READY" ]; then
         rollback "guest UI not ready after ${ELAPSED}s"
     fi
 
